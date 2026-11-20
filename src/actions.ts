@@ -173,8 +173,13 @@ export const replaceCurrentView = async (
     log.info(
       `[Actions] RAM First-Page Micro-Cache HIT for ${baseTableName} (${ramCache.totalRowCount} rows)`
     );
-    queryTableName = ramCache.tableName;
-    baseSchema = ramCache.schema;
+    // Ensure DuckDB view is bound to the live Parquet cache path (guards against stale views after project reset/purge)
+    try {
+      queryTableName = await dbc.getTableName(dsPath, { forceReopen: false });
+    } catch {
+      queryTableName = ramCache.tableName;
+    }
+    baseSchema = ramCache.fullSchema || ramCache.schema;
 
     const rowData: DataRow[] = [];
     for (let i = 0; i < ramCache.tableRep.rowData.length; i++) {
@@ -187,13 +192,15 @@ export const replaceCurrentView = async (
       rowData.push(row);
     }
     const pSize = getDefaultPageSize();
+    const isPartialCache = rowData.length < Math.min(ramCache.totalRowCount, pSize);
     initialDataView = new PagedDataView(
-      baseSchema,
+      ramCache.tableRep?.schema || ramCache.schema,
       ramCache.totalRowCount,
       0,
       rowData,
       1,
-      pSize
+      pSize,
+      isPartialCache
     );
   } else {
     queryTableName = await dbc.getTableName(dsPath, { forceReopen });
@@ -425,12 +432,13 @@ export const openDataSourcePath = async (
           const vs = mutableGet(stateRef).viewState;
           if (vs && vs.baseSchema && dv.rawData) {
             const pSize = getDefaultPageSize();
+            const tableName =
+              (vs.baseQuery as any)?._rep?.tableName || fileName;
             manager.setFirstPageCache(canon, {
-              tableName:
-                (vs.baseQuery as any).tableName ||
-                fileName,
-              schema: vs.baseSchema,
-              tableRep: new reltab.TableRep(vs.baseSchema, dv.rawData),
+              tableName,
+              schema: dv.schema,
+              fullSchema: vs.baseSchema,
+              tableRep: new reltab.TableRep(dv.schema, dv.rawData),
               totalRowCount: dv.totalRowCount,
               pageSize: pSize,
               bufferPages: 3,
@@ -1506,7 +1514,7 @@ export const applyColumnExtraction = async (
         .join(" AND ");
 
       const preflightSql = `${cteClause}SELECT 1 FROM (SELECT ${selectExclude}, ${headerProjectClause}${extractClauses.join(", ")} ${fromSourceClause}) _sub WHERE ${allExtractedNullCond} LIMIT 1`;
-      
+
       let hasUnmatchedRows = false;
       try {
         const checkRows = await dbc.runSqlQuery(preflightSql);
@@ -1556,8 +1564,8 @@ export const applyColumnExtraction = async (
         sourceColumn: params.targetCol,
         regexPattern: params.regexPattern,
       })
-      .catch(() => {});
-  } catch {}
+      .catch(() => { });
+  } catch { }
 
   // 7. Construct new base query and retrieve updated schema
   const newBaseQuery = reltab.tableQuery(newTableName);
@@ -1720,7 +1728,10 @@ export const setColumnDisplayName = (
         nextDataSchema,
         vs.dataView.totalRowCount,
         vs.dataView.offset,
-        vs.dataView.rawData
+        vs.dataView.rawData,
+        vs.dataView.currentPage,
+        vs.dataView.pageSize,
+        vs.dataView.isPartialCache
       );
       nextVs = nextVs.set("dataView", nextDataView) as ViewState;
     }

@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useState, useMemo, useEffect, useRef, useCallback } from "react";
-import { Button, InputGroup, Tag } from "@blueprintjs/core";
+import { Button, InputGroup, Intent, Spinner, Tag } from "@blueprintjs/core";
 import * as reltab from "reltab";
 import { DataRow } from "../PagedDataView";
 import { SimpleClipboard } from "./SimpleClipboard";
@@ -18,6 +18,9 @@ export interface EventDetailSidebarProps {
   rowData: DataRow | null;
   rowIndex: number | null;
   globalRowIndex?: number | null;
+  isLoadingFullRow?: boolean;
+  totalSchemaCols?: number;
+  fullRowError?: string | null;
   onClose: () => void;
   clipboard?: SimpleClipboard;
   onAddFilter?: (cid: string, value: any, displayName: string) => void;
@@ -55,22 +58,36 @@ const shortenType = (type: string | undefined): string => {
   }
 };
 
+const MAX_JSON_UNPACK_CHARS = 262_144;
+
+const isEmptyFieldValue = (val: any): boolean =>
+  val === null || val === undefined || val === "";
+
 const EventDetailSidebarInner: React.FC<EventDetailSidebarProps> = ({
   schema,
   rowData,
   rowIndex,
   globalRowIndex,
+  isLoadingFullRow,
+  totalSchemaCols,
+  fullRowError,
   onClose,
   clipboard,
   onAddFilter,
 }) => {
   const [sidebarWidth, setSidebarWidth] = useState<number>(440);
   const [searchTerm, setSearchTerm] = useState<string>("");
+  const isWideSchema = Boolean(schema?.columns && schema.columns.length > 100);
+  const [hideEmptyFields, setHideEmptyFields] = useState<boolean>(isWideSchema);
   const [copiedAll, setCopiedAll] = useState<boolean>(false);
   const [copiedCid, setCopiedCid] = useState<string | null>(null);
   const [addedFilterCid, setAddedFilterCid] = useState<string | null>(null);
   const [activeDecoded, setActiveDecoded] = useState<{ [cid: string]: DecodeResult }>({});
   const [copiedDecodedCid, setCopiedDecodedCid] = useState<string | null>(null);
+
+  useEffect(() => {
+    setHideEmptyFields(isWideSchema);
+  }, [isWideSchema]);
 
   const handleDecode = useCallback(
     (
@@ -229,10 +246,12 @@ const EventDetailSidebarInner: React.FC<EventDetailSidebarProps> = ({
     }
 
     // 3. Unpack nested JSON fields if present (e.g. Details, ExtraFieldInfo, EventData)
+    // Skip automatic JSON.parse() on huge blobs (> 256 KB) to protect the UI thread.
     const jsonUnpacked: FieldEntry[] = [];
     for (const entry of entries) {
       if (
         typeof entry.value === "string" &&
+        entry.value.length <= MAX_JSON_UNPACK_CHARS &&
         entry.value.trim().startsWith("{")
       ) {
         try {
@@ -259,13 +278,27 @@ const EventDetailSidebarInner: React.FC<EventDetailSidebarProps> = ({
     return entries;
   }, [schema, rowData]);
 
-  // Filter fields based on search term (with slash and backslash normalization)
+  const emptyFieldCount = useMemo(() => {
+    let count = 0;
+    for (const entry of fieldEntries) {
+      if (isEmptyFieldValue(entry.value)) {
+        count++;
+      }
+    }
+    return count;
+  }, [fieldEntries]);
+
+  // Filter fields based on hideEmptyFields and search term (with slash and backslash normalization)
   const filteredEntries = useMemo(() => {
+    const visibleEntries = hideEmptyFields
+      ? fieldEntries.filter((entry) => !isEmptyFieldValue(entry.value))
+      : fieldEntries;
+
     const q = searchTerm.trim().toLowerCase();
-    if (!q) return fieldEntries;
+    if (!q) return visibleEntries;
     const qNorm = q.replace(/[\\\/]+/g, "/");
 
-    return fieldEntries.filter((entry) => {
+    return visibleEntries.filter((entry) => {
       const nameLower = entry.displayName.toLowerCase();
       const cidLower = entry.cid.toLowerCase();
       const matchName =
@@ -283,7 +316,7 @@ const EventDetailSidebarInner: React.FC<EventDetailSidebarProps> = ({
       }
       return matchName || matchVal;
     });
-  }, [fieldEntries, searchTerm]);
+  }, [fieldEntries, hideEmptyFields, searchTerm]);
 
 
   // Copy text helper
@@ -395,6 +428,18 @@ const EventDetailSidebarInner: React.FC<EventDetailSidebarProps> = ({
               Row #{rowNumber}
             </span>
           )}
+          {isLoadingFullRow && (
+            <Tag
+              minimal
+              intent={Intent.PRIMARY}
+              icon={<Spinner size={10} />}
+              style={{ fontSize: 10, padding: "1px 6px", flexShrink: 0 }}
+            >
+              {totalSchemaCols
+                ? `Loading all ${totalSchemaCols.toLocaleString()} fields...`
+                : "Loading all fields..."}
+            </Tag>
+          )}
         </div>
         <div className="event-detail-header-right">
           <button
@@ -426,6 +471,35 @@ const EventDetailSidebarInner: React.FC<EventDetailSidebarProps> = ({
         </div>
       </div>
 
+      {/* Full-row hydration error notice */}
+      {fullRowError && !isLoadingFullRow && (
+        <div
+          className="event-detail-error-banner"
+          title={fullRowError}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "4px 10px",
+            fontSize: 11,
+            backgroundColor: "rgba(219, 55, 55, 0.12)",
+            color: "#c23030",
+            borderBottom: "1px solid rgba(219, 55, 55, 0.25)",
+          }}
+        >
+          <span className="bp4-icon bp4-icon-warning-sign" />
+          <span
+            style={{
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            Partial fields only (full-row fetch failed: {fullRowError})
+          </span>
+        </div>
+      )}
+
       {/* Search Filter Bar */}
       <div className="event-detail-search-bar">
         <InputGroup
@@ -447,6 +521,22 @@ const EventDetailSidebarInner: React.FC<EventDetailSidebarProps> = ({
           }
           small
         />
+        {emptyFieldCount > 0 && (
+          <Button
+            small
+            minimal
+            active={!hideEmptyFields}
+            onClick={() => setHideEmptyFields((prev) => !prev)}
+            title={
+              hideEmptyFields
+                ? `Show ${emptyFieldCount} empty/null fields`
+                : "Hide empty/null fields"
+            }
+            style={{ fontSize: 10, whiteSpace: "nowrap", flexShrink: 0 }}
+          >
+            {hideEmptyFields ? `Show empty (${emptyFieldCount})` : "Hide empty"}
+          </Button>
+        )}
         <span className="event-detail-count-badge">
           {filteredEntries.length} / {fieldEntries.length}
         </span>
@@ -457,7 +547,24 @@ const EventDetailSidebarInner: React.FC<EventDetailSidebarProps> = ({
         {filteredEntries.length === 0 ? (
           <div className="event-detail-empty">
             <span className="bp4-icon bp4-icon-search event-detail-empty-icon" />
-            <p>No fields match &quot;{searchTerm}&quot;</p>
+            <p>
+              {searchTerm
+                ? `No ${hideEmptyFields ? "non-empty " : ""}fields match "${searchTerm}"`
+                : hideEmptyFields && emptyFieldCount > 0
+                ? `All ${fieldEntries.length} fields are empty/null`
+                : "No fields to display"}
+            </p>
+            {hideEmptyFields && emptyFieldCount > 0 && (
+              <Button
+                small
+                minimal
+                intent={Intent.PRIMARY}
+                style={{ marginTop: 8 }}
+                onClick={() => setHideEmptyFields(false)}
+              >
+                Show empty ({emptyFieldCount})
+              </Button>
+            )}
           </div>
         ) : (
           <table className="event-detail-table">

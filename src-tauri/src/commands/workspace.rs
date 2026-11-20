@@ -252,6 +252,45 @@ pub async fn handle_add_folder(
     })
 }
 
+/// Drop stale DuckDB views on the UI connection so subsequent queries never read deleted Parquet paths.
+/// When `view_names` is `None`, drops `"main_table"` and every `"tbl_*"` view currently registered.
+async fn drop_stale_duckdb_views(state: &AppState, view_names: Option<Vec<String>>) {
+    let pool = state.get_duckdb_pool().await;
+    let _ = pool
+        .eval_ui_conn(move |conn| {
+            let targets: Vec<String> = match view_names {
+                Some(mut list) => {
+                    if !list.iter().any(|v| v == "main_table") {
+                        list.push("main_table".to_string());
+                    }
+                    list
+                }
+                None => {
+                    let mut list = vec!["main_table".to_string()];
+                    if let Ok(mut stmt) = conn.prepare(
+                        "SELECT view_name FROM duckdb_views() WHERE internal = false AND view_name LIKE 'tbl_%'",
+                    ) {
+                        if let Ok(mut rows) = stmt.query([]) {
+                            while let Ok(Some(row)) = rows.next() {
+                                if let Ok(vname) = row.get::<_, String>(0) {
+                                    list.push(vname);
+                                }
+                            }
+                        }
+                    }
+                    list
+                }
+            };
+
+            for v in targets {
+                let escaped = v.replace('"', "\"\"");
+                let _ = conn.execute_batch(&format!("DROP VIEW IF EXISTS \"{}\";", escaped));
+            }
+            Ok(())
+        })
+        .await;
+}
+
 /// DELETE PROJECT: Cascade deletes project metadata and cache
 pub async fn handle_delete_project(
     state: &AppState,
@@ -260,11 +299,21 @@ pub async fn handle_delete_project(
     let project_id = get_str_param(&payload, "projectId", "project_id")
         .ok_or_else(|| ErrorResponse::invalid_argument("Missing projectId parameter"))?;
 
-    let ledger = state.parquet_ledger.read().await;
-    let (deleted_files, freed_bytes) = ledger
-        .delete_project(project_id)
-        .await
-        .map_err(|e| ErrorResponse::internal_error(format!("Failed to delete project: {}", e)))?;
+    let (deleted_files, freed_bytes, project_temp_dir) = {
+        let ledger = state.parquet_ledger.read().await;
+        let p_dir = ledger.temp_dir.join(project_id);
+        let (df, fb) = ledger
+            .delete_project(project_id)
+            .await
+            .map_err(|e| ErrorResponse::internal_error(format!("Failed to delete project: {}", e)))?;
+        ledger.emit_cache_invalidate(None);
+        (df, fb, p_dir)
+    };
+
+    let stale_views = state
+        .remove_view_parquet_paths_for_project(&project_temp_dir)
+        .await;
+    drop_stale_duckdb_views(state, Some(stale_views)).await;
 
     Ok(DeleteProjectResponse {
         success: true,
@@ -278,11 +327,18 @@ pub async fn handle_delete_all_projects(
     state: &AppState,
     _payload: Value,
 ) -> Result<DeleteAllProjectsResponse, ErrorResponse> {
-    let ledger = state.parquet_ledger.read().await;
-    let (deleted_projects, freed_bytes) = ledger
-        .delete_all_projects()
-        .await
-        .map_err(|e| ErrorResponse::internal_error(format!("Failed to delete all projects: {}", e)))?;
+    let (deleted_projects, freed_bytes) = {
+        let ledger = state.parquet_ledger.read().await;
+        let res = ledger
+            .delete_all_projects()
+            .await
+            .map_err(|e| ErrorResponse::internal_error(format!("Failed to delete all projects: {}", e)))?;
+        ledger.emit_cache_invalidate(None);
+        res
+    };
+
+    state.clear_all_view_parquet_paths().await;
+    drop_stale_duckdb_views(state, None).await;
 
     Ok(DeleteAllProjectsResponse {
         success: true,
@@ -377,16 +433,25 @@ pub async fn handle_purge_cache(
     state: &AppState,
     payload: Value,
 ) -> Result<PurgeCacheResponse, ErrorResponse> {
-    let ledger = state.parquet_ledger.read().await;
-    let project_id = match get_str_param(&payload, "projectId", "project_id") {
-        Some(s) => s.to_string(),
-        None => ledger.get_active_project_id().await,
+    let (purged_files, freed_bytes, project_temp_dir) = {
+        let ledger = state.parquet_ledger.read().await;
+        let project_id = match get_str_param(&payload, "projectId", "project_id") {
+            Some(s) => s.to_string(),
+            None => ledger.get_active_project_id().await,
+        };
+        let p_dir = ledger.temp_dir.join(&project_id);
+        let (pf, fb) = ledger
+            .purge_cache(&project_id)
+            .await
+            .map_err(|e| ErrorResponse::internal_error(format!("Failed to purge cache: {}", e)))?;
+        ledger.emit_cache_invalidate(None);
+        (pf, fb, p_dir)
     };
 
-    let (purged_files, freed_bytes) = ledger
-        .purge_cache(&project_id)
-        .await
-        .map_err(|e| ErrorResponse::internal_error(format!("Failed to purge cache: {}", e)))?;
+    let stale_views = state
+        .remove_view_parquet_paths_for_project(&project_temp_dir)
+        .await;
+    drop_stale_duckdb_views(state, Some(stale_views)).await;
 
     Ok(PurgeCacheResponse {
         purged_files,
@@ -402,19 +467,37 @@ pub async fn handle_remove_file(
     state: &AppState,
     payload: Value,
 ) -> Result<RemoveFileResponse, ErrorResponse> {
-    let ledger = state.parquet_ledger.read().await;
-    let project_id = match get_str_param(&payload, "projectId", "project_id") {
-        Some(s) => s.to_string(),
-        None => ledger.get_active_project_id().await,
-    };
-
     let file_path = get_str_param(&payload, "filePath", "file_path")
         .ok_or_else(|| ErrorResponse::invalid_argument("Missing filePath parameter"))?;
 
-    let freed_bytes = ledger
-        .remove_file_from_project(&project_id, file_path)
-        .await
-        .map_err(|e| ErrorResponse::internal_error(format!("Failed to remove file: {}", e)))?;
+    let (freed_bytes, removed_parquet) = {
+        let ledger = state.parquet_ledger.read().await;
+        let project_id = match get_str_param(&payload, "projectId", "project_id") {
+            Some(s) => s.to_string(),
+            None => ledger.get_active_project_id().await,
+        };
+        let norm = crate::ledger::parquet_ledger::normalize_path(file_path);
+        let pq_path = {
+            let st = ledger.state.read().await;
+            st.files
+                .get(&norm)
+                .map(|f| std::path::PathBuf::from(&f.parquet_path))
+                .filter(|p| !p.as_os_str().is_empty())
+        };
+        let fb = ledger
+            .remove_file_from_project(&project_id, file_path)
+            .await
+            .map_err(|e| ErrorResponse::internal_error(format!("Failed to remove file: {}", e)))?;
+        ledger.emit_cache_invalidate(Some(file_path));
+        (fb, pq_path)
+    };
+
+    if let Some(pq) = removed_parquet {
+        let stale_views = state.remove_view_parquet_paths_for_file(&pq).await;
+        if !stale_views.is_empty() {
+            drop_stale_duckdb_views(state, Some(stale_views)).await;
+        }
+    }
 
     Ok(RemoveFileResponse {
         freed_bytes,

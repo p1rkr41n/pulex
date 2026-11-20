@@ -283,12 +283,12 @@ fn build_version_info() -> Vec<u8> {
     let strings = [
         ("CompanyName", "HelloKittyXamKinLung"),
         ("FileDescription", "Pulex Data Analyzer"),
-        ("FileVersion", "3.0.3"),
+        ("FileVersion", "3.0.4"),
         ("InternalName", "pulex.exe"),
         ("LegalCopyright", "Copyright \u{00A9} 2026 HelloKittyXamKinLung"),
         ("OriginalFilename", "pulex.exe"),
         ("ProductName", "Pulex"),
-        ("ProductVersion", "3.0.3"),
+        ("ProductVersion", "3.0.4"),
     ];
 
     let mut str_entries = Vec::new();
@@ -356,11 +356,11 @@ fn build_version_info() -> Vec<u8> {
     let vfi_len = vfi.len() as u16;
     vfi[0..2].copy_from_slice(&vfi_len.to_le_bytes());
 
-    // VS_FIXEDFILEINFO (52 bytes): 3.0.3.0
+    // VS_FIXEDFILEINFO (52 bytes): 3.0.4.0
     let file_ver_ms: u32 = 3 << 16;
-    let file_ver_ls: u32 = 3 << 16;
+    let file_ver_ls: u32 = 4 << 16;
     let prod_ver_ms: u32 = 3 << 16;
-    let prod_ver_ls: u32 = 3 << 16;
+    let prod_ver_ls: u32 = 4 << 16;
     let mut ffi = Vec::new();
     ffi.extend_from_slice(&0xFEEF04BDu32.to_le_bytes());
     ffi.extend_from_slice(&0x00010000u32.to_le_bytes());
@@ -397,7 +397,7 @@ fn build_version_info() -> Vec<u8> {
 fn build_manifest_xml() -> Vec<u8> {
     br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <assemblyIdentity type="win32" name="com.pulex.analyzer" version="3.0.3.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="com.pulex.analyzer" version="3.0.4.0" processorArchitecture="amd64"/>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>

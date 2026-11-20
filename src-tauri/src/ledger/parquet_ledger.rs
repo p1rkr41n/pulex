@@ -251,10 +251,24 @@ impl ParquetLedger {
         }
     }
 
-    /// Inject live Tauri AppHandle so debounced recovery can emit `project:workspaceChanged`
+    /// Inject live Tauri AppHandle so debounced recovery and cache invalidation can emit events
     pub fn set_app_handle(&self, handle: tauri::AppHandle) {
         if let Ok(mut guard) = self.app_handle.write() {
             *guard = Some(handle);
+        }
+    }
+
+    /// Notify frontend to invalidate RAM First-Page Micro-Cache (all or for a specific sourcePath)
+    pub fn emit_cache_invalidate(&self, source_path: Option<&str>) {
+        if let Ok(guard) = self.app_handle.read() {
+            if let Some(ref handle) = *guard {
+                use tauri::Emitter;
+                let payload = match source_path {
+                    Some(p) => serde_json::json!({ "sourcePath": p }),
+                    None => serde_json::json!({}),
+                };
+                let _ = handle.emit("cache:invalidate", payload);
+            }
         }
     }
 

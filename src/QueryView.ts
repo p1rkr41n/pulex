@@ -7,6 +7,7 @@ import * as reltab from "reltab";
 export interface QueryViewProps {
   baseQuery: reltab.QueryExp | null;
   query: reltab.QueryExp | null;
+  fullRowQuery: reltab.QueryExp | null;
   histoMap: reltab.ColumnHistogramMap | null;
   rowCount: number;
   baseRowCount: number;
@@ -16,6 +17,7 @@ export interface QueryViewProps {
 const defaultQueryViewProps: QueryViewProps = {
   baseQuery: null,
   query: null,
+  fullRowQuery: null,
   histoMap: null,
   rowCount: 0,
   // The following fields are just for auxiliary info in footer
@@ -29,6 +31,7 @@ export class QueryView
 {
   public readonly baseQuery!: reltab.QueryExp;
   public readonly query!: reltab.QueryExp;
+  public readonly fullRowQuery!: reltab.QueryExp | null;
   public readonly histoMap!: reltab.ColumnHistogramMap;
   public readonly rowCount!: number;
   public readonly baseRowCount!: number;

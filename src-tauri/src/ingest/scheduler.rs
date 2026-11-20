@@ -24,6 +24,7 @@ use crate::ingest::csv_streamer::{
 };
 use crate::ingest::dirty_log::{ingest_dirty_log, ingest_dirty_log_duckdb};
 use crate::ingest::evtx_parser::ingest_evtx_file;
+use crate::ingest::io_monitor::get_system_memory_status;
 use crate::ingest::jsonl_streamer::ingest_jsonl_file_with_options;
 use crate::ingest::progress::ProgressDispatcher;
 use crate::ledger::parquet_ledger::{
@@ -541,27 +542,50 @@ impl IngestionScheduler {
                         }
                         Some(job)
                     } else if active_count < max_slots {
-                        // Look for the first job that fits under max_concurrent_bytes, or VIP job
-                        let mut selected_idx = None;
-                        for (idx, job) in st.pending.iter().enumerate() {
-                            if job.priority == IngestPriority::Vip
-                                || current_in_flight_bytes + job.file_size <= st.max_concurrent_bytes
-                            {
-                                selected_idx = Some(idx);
-                                break;
+                        // Live RAM pressure admission control: defer extra concurrent workers
+                        // when host memory load >= 85% or available RAM < 1.5 GB.
+                        let ram_pressure_high = if let Some(mem) = get_system_memory_status() {
+                            const MIN_AVAIL_BYTES: u64 = 1_536 * 1024 * 1024;
+                            if mem.memory_load_pct >= 85 || mem.avail_bytes < MIN_AVAIL_BYTES {
+                                tracing::warn!(
+                                    memory_load_pct = mem.memory_load_pct,
+                                    avail_mb = mem.avail_bytes / (1024 * 1024),
+                                    active_count = active_count,
+                                    "RAM pressure throttle active: deferring additional concurrent ingestion worker"
+                                );
+                                true
+                            } else {
+                                false
                             }
-                        }
-
-                        if let Some(idx) = selected_idx {
-                            let removed = st.pending.remove(idx);
-                            if removed.priority == IngestPriority::Vip
-                                && !st.pending.iter().any(|j| j.priority == IngestPriority::Vip)
-                            {
-                                st.burst_lane_active = false;
-                            }
-                            Some(removed)
                         } else {
+                            false
+                        };
+
+                        if ram_pressure_high {
                             None
+                        } else {
+                            // Look for the first job that fits under max_concurrent_bytes, or VIP job
+                            let mut selected_idx = None;
+                            for (idx, job) in st.pending.iter().enumerate() {
+                                if job.priority == IngestPriority::Vip
+                                    || current_in_flight_bytes + job.file_size <= st.max_concurrent_bytes
+                                {
+                                    selected_idx = Some(idx);
+                                    break;
+                                }
+                            }
+
+                            if let Some(idx) = selected_idx {
+                                let removed = st.pending.remove(idx);
+                                if removed.priority == IngestPriority::Vip
+                                    && !st.pending.iter().any(|j| j.priority == IngestPriority::Vip)
+                                {
+                                    st.burst_lane_active = false;
+                                }
+                                Some(removed)
+                            } else {
+                                None
+                            }
                         }
                     } else {
                         None
@@ -635,18 +659,29 @@ impl IngestionScheduler {
                 Ok(0)
             }
             "evtx" => {
-                let disp = self.dispatcher.clone();
-                let fid = job.file_id.clone();
-                let ct = cancellation_token.clone();
-                let src = src_path.clone();
-                let dst = dst_parquet.clone();
-                tokio::task::spawn_blocking(move || {
-                    let res = ingest_evtx_file(&fid, &src, &dst, evtx_threads, &ct, Some(&disp))?;
-                    Ok(res.row_count)
-                })
-                .await
-                .map_err(|e| format!("Join error: {}", e))
-                .and_then(|r| r)
+                let permit_res = if let Some(ref pool) = self.duckdb_pool {
+                    pool.acquire_worker_permit().await.map(Some)
+                } else {
+                    Ok(None)
+                };
+                match permit_res {
+                    Ok(_permit) => {
+                        let disp = self.dispatcher.clone();
+                        let fid = job.file_id.clone();
+                        let ct = cancellation_token.clone();
+                        let src = src_path.clone();
+                        let dst = dst_parquet.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let res =
+                                ingest_evtx_file(&fid, &src, &dst, evtx_threads, &ct, Some(&disp))?;
+                            Ok(res.row_count)
+                        })
+                        .await
+                        .map_err(|e| format!("Join error: {}", e))
+                        .and_then(|r| r)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             "csv" | "tsv" | "tab" | "txt" => {
                 if let Some(ref pool) = self.duckdb_pool {

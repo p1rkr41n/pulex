@@ -19,6 +19,7 @@ export class PagedDataView {
   rawData: Array<DataRow>; // sliding buffer rows (at most 5,000 rows)
   currentPage: number; // 1-indexed current page
   pageSize: number; // rows per page (1,000)
+  isPartialCache: boolean;
 
   constructor(
     schema: reltab.Schema,
@@ -26,7 +27,8 @@ export class PagedDataView {
     offset: number,
     items: Array<DataRow>,
     currentPage: number = 1,
-    pageSize: number = 1000
+    pageSize: number = 1000,
+    isPartialCache: boolean = false
   ) {
     this.schema = schema;
     this.totalRowCount = totalRowCount;
@@ -34,6 +36,7 @@ export class PagedDataView {
     this.rawData = items;
     this.currentPage = currentPage;
     this.pageSize = pageSize;
+    this.isPartialCache = isPartialCache;
   }
 
   withPage(newPage: number): PagedDataView {
@@ -43,17 +46,27 @@ export class PagedDataView {
       this.offset,
       this.rawData,
       newPage,
-      this.pageSize
+      this.pageSize,
+      this.isPartialCache
     );
   }
 
-  // Returns number of rows on current page (up to 1,000) for SlickGrid rendering
+  // Returns number of rows on current page (up to pageSize) for SlickGrid rendering
   getLength(): number {
     const pageStart = (this.currentPage - 1) * this.pageSize;
     if (pageStart >= this.totalRowCount) {
       return 0;
     }
-    return Math.min(this.pageSize, this.totalRowCount - pageStart);
+    const nominalLen = Math.min(this.pageSize, this.totalRowCount - pageStart);
+    if (this.isPartialCache) {
+      const overlapStart = Math.max(pageStart, this.offset);
+      const overlapEnd = Math.min(
+        pageStart + nominalLen,
+        this.offset + this.rawData.length
+      );
+      return Math.max(0, overlapEnd - overlapStart);
+    }
+    return nominalLen;
   }
 
   getOffset(): number {

@@ -31,6 +31,86 @@ export const setAutoSortMaxRows = (maxRows: number): void => {
 
 export const getAutoSortMaxRows = (): number => autoSortMaxRowsThreshold;
 
+const WIDE_TABLE_AUTOSORT_COL_LIMIT = 200;
+const AUTOSORT_MAX_CELL_BUDGET = 10_000_000;
+const ADAPTIVE_CELL_BUDGET = 250_000;
+
+export function computeProjectedColumns(
+  baseSchema: reltab.Schema,
+  viewParams: ViewParams,
+  effectiveSortKey: [string, boolean][] | undefined
+): string[] {
+  const wanted = new Set<string>();
+  const displayCols =
+    viewParams.displayColumns && viewParams.displayColumns.length > 0
+      ? viewParams.displayColumns
+      : baseSchema.columns.slice(0, 100);
+  for (const c of displayCols) {
+    if (baseSchema.hasColumn(c)) wanted.add(c);
+  }
+  for (const c of viewParams.vpivots || []) {
+    if (baseSchema.hasColumn(c)) wanted.add(c);
+  }
+  if (
+    viewParams.pivotLeafColumn &&
+    baseSchema.hasColumn(viewParams.pivotLeafColumn)
+  ) {
+    wanted.add(viewParams.pivotLeafColumn);
+  }
+  for (const [sortCol] of effectiveSortKey || []) {
+    if (baseSchema.hasColumn(sortCol)) wanted.add(sortCol);
+  }
+  if (baseSchema.hasColumn("Rec")) {
+    wanted.add("Rec");
+  }
+  const seen = new Set<string>();
+  return baseSchema.columns.filter((c) => {
+    if (!wanted.has(c) || seen.has(c)) return false;
+    seen.add(c);
+    return true;
+  });
+}
+
+export function buildPrunedSchema(
+  baseSchema: reltab.Schema,
+  projectedCols: string[]
+): reltab.Schema {
+  const prunedMeta: reltab.ColumnMetaMap = {};
+  for (const c of projectedCols) {
+    if (baseSchema.columnMetadata && baseSchema.columnMetadata[c]) {
+      prunedMeta[c] = baseSchema.columnMetadata[c];
+    }
+  }
+  return new reltab.Schema(baseSchema.dialect, projectedCols, prunedMeta);
+}
+
+function computeEffectiveSortKey(
+  baseSchema: reltab.Schema,
+  viewParams: ViewParams,
+  baseRowCount: number
+): [string, boolean][] {
+  let effectiveSortKey = viewParams.sortKey || [];
+  if (effectiveSortKey.length === 0) {
+    const projectedCount = Math.max(
+      1,
+      viewParams.displayColumns?.length || baseSchema.columns.length
+    );
+    const allowAutoSort =
+      baseSchema.columns.length <= WIDE_TABLE_AUTOSORT_COL_LIMIT &&
+      (autoSortMaxRowsThreshold < 0 ||
+        (autoSortMaxRowsThreshold > 0 &&
+          baseRowCount <= autoSortMaxRowsThreshold)) &&
+      baseRowCount * projectedCount <= AUTOSORT_MAX_CELL_BUDGET;
+    if (allowAutoSort) {
+      const timeCol = findBestTimeColumn(baseSchema);
+      if (timeCol) {
+        effectiveSortKey = [[timeCol, false]]; // DESC sort for deterministic ordering
+      }
+    }
+  }
+  return effectiveSortKey;
+}
+
 // Error dialogs are handled via IHostBridge.showErrorDialog()
 /**
  * Use ViewParams to construct a PagedDataView for use with
@@ -43,7 +123,8 @@ const mkDataView = (
   offset: number,
   tableData: reltab.TableRep,
   currentPage: number = 1,
-  pageSize: number = 1000
+  pageSize: number = 1000,
+  isPartialCache: boolean = false
 ): PagedDataView => {
   const getPath = (dataRow: DataRow, depth: number) => {
     let path: Array<string | null> = [];
@@ -82,7 +163,8 @@ const mkDataView = (
     offset,
     rowData,
     currentPage,
-    pageSize
+    pageSize,
+    isPartialCache
   );
   return dataView;
 };
@@ -223,37 +305,34 @@ const requestQueryView = async (
     type: "filtered" | "unfiltered" | "view"
   ) => void
 ): Promise<QueryView> => {
-  const schemaCols = baseSchema.columns;
-  const aggMap: any = {};
-
-  for (let cid of schemaCols) {
-    aggMap[cid] = viewParams.getAggFn(baseSchema, cid);
-  }
-
   const effectiveFilterExp = viewParams.filterExp;
 
   onViewRowCount?.(baseQuery, "unfiltered");
   const baseRowCount = await rt.rowCount(baseQuery);
   onViewRowCountResolved?.(baseQuery, baseRowCount, "unfiltered");
 
-  let effectiveSortKey = viewParams.sortKey;
-  if (!effectiveSortKey || effectiveSortKey.length === 0) {
-    const allowAutoSort =
-      autoSortMaxRowsThreshold < 0 ||
-      (autoSortMaxRowsThreshold > 0 && baseRowCount <= autoSortMaxRowsThreshold);
-    if (allowAutoSort) {
-      const timeCol = findBestTimeColumn(baseSchema);
-      if (timeCol) {
-        effectiveSortKey = [[timeCol, false]]; // DESC sort for deterministic ordering
-      }
-    }
+  const effectiveSortKey = computeEffectiveSortKey(
+    baseSchema,
+    viewParams,
+    baseRowCount
+  );
+  const projectedCols = computeProjectedColumns(
+    baseSchema,
+    viewParams,
+    effectiveSortKey
+  );
+  const prunedSchema = buildPrunedSchema(baseSchema, projectedCols);
+  const aggMap: any = {};
+
+  for (const cid of prunedSchema.columns) {
+    aggMap[cid] = viewParams.getAggFn(prunedSchema, cid);
   }
 
   const filterQuery = baseQuery.filter(effectiveFilterExp);
   const ptree = await aggtree.vpivot(
     rt,
     filterQuery,
-    baseSchema,
+    prunedSchema,
     viewParams.vpivots,
     viewParams.pivotLeafColumn,
     viewParams.showRoot,
@@ -298,9 +377,17 @@ const requestQueryView = async (
     }
   }
 
+  const fullRowQuery =
+    viewParams.vpivots.length === 0
+      ? effectiveSortKey && effectiveSortKey.length > 0
+        ? filterQuery.sort(effectiveSortKey)
+        : filterQuery
+      : null;
+
   const ret = new QueryView({
     baseQuery,
     query: treeQuery,
+    fullRowQuery,
     histoMap,
     baseRowCount,
     filterRowCount,
@@ -321,7 +408,8 @@ const requestDataView = async (
     limit?: number
   ) => void,
   currentPage: number = 1,
-  pageSize: number = 1000
+  pageSize: number = 1000,
+  isPartialCache: boolean = false
 ): Promise<PagedDataView> => {
   onViewQuery?.(queryView.query, offset, limit);
   const tableData = await rt.evalQuery(queryView.query, offset, limit);
@@ -331,7 +419,8 @@ const requestDataView = async (
     offset,
     tableData,
     currentPage,
-    pageSize
+    pageSize,
+    isPartialCache
   );
   return dataView;
 };
@@ -383,6 +472,8 @@ export class PivotRequester {
   pendingOffset: number;
   pendingLimit: number;
   pendingPage: number;
+  pendingIsPartialCache: boolean;
+  isInternalStateUpdate: boolean;
   pageSize: number;
   errorCallback?: (e: Error) => void;
   setLoadingCallback: (loading: boolean) => void;
@@ -415,6 +506,8 @@ export class PivotRequester {
     this.pendingOffset = 0;
     this.pendingLimit = 0;
     this.pendingPage = 1;
+    this.pendingIsPartialCache = false;
+    this.isInternalStateUpdate = false;
     this.pageSize = 1000;
     this.errorCallback = errorCallback;
     this.setLoadingCallback = setLoadingCallback || noopSetLoadingCallback;
@@ -443,15 +536,79 @@ export class PivotRequester {
     const totalPages = Math.max(1, Math.ceil(totalRowCount / pSize));
     const safePage = Math.min(Math.max(1, curPage), totalPages);
 
-    // 5-page sliding buffer: [P-2, P-1, P, P+1, P+2] (max 5,000 rows)
-    const bufStartPage = Math.max(1, safePage - 2);
-    const bufEndPage = Math.min(totalPages, safePage + 2);
-    const offset = (bufStartPage - 1) * pSize;
-    const limit = (bufEndPage - bufStartPage + 1) * pSize;
+    const effectiveSortKey = viewState.baseSchema
+      ? computeEffectiveSortKey(
+          viewState.baseSchema,
+          viewParams,
+          queryView.baseRowCount
+        )
+      : undefined;
+    const projectedCols = viewState.baseSchema
+      ? computeProjectedColumns(
+          viewState.baseSchema,
+          viewParams,
+          effectiveSortKey
+        )
+      : viewParams.displayColumns || [];
+    const colCount = Math.max(
+      1,
+      projectedCols.length || viewParams.displayColumns?.length || 1
+    );
+
+    // Adaptive cell-budget sliding buffer
+    const bufferRadius = colCount <= 30 ? 2 : colCount <= 80 ? 1 : 0;
+    const bufStartPage = Math.max(1, safePage - bufferRadius);
+    const bufEndPage = Math.min(totalPages, safePage + bufferRadius);
+    const pageStart = (safePage - 1) * pSize;
+    const nominalPageLen = Math.min(
+      pSize,
+      Math.max(0, totalRowCount - pageStart)
+    );
+
+    let offset = (bufStartPage - 1) * pSize;
+    let limit = Math.min(
+      (bufEndPage - bufStartPage + 1) * pSize,
+      Math.max(0, totalRowCount - offset)
+    );
+
+    const maxRowsByBudget = Math.max(
+      100,
+      Math.floor(ADAPTIVE_CELL_BUDGET / Math.max(1, colCount))
+    );
+
+    if (limit > maxRowsByBudget) {
+      const neededActiveRows = Math.min(nominalPageLen, maxRowsByBudget);
+      if (offset + maxRowsByBudget < pageStart + neededActiveRows) {
+        offset = pageStart;
+        limit = Math.min(
+          Math.max(0, totalRowCount - offset),
+          maxRowsByBudget
+        );
+      } else {
+        limit = maxRowsByBudget;
+      }
+    }
+
+    const activeAvailable = Math.max(0, offset + limit - pageStart);
+    const isPartialCache = activeAvailable < nominalPageLen;
+
+    if (viewState.queryError !== null) {
+      this.isInternalStateUpdate = true;
+      try {
+        oneref.update(
+          stateRef,
+          vsUpdate((vs: ViewState) => vs.set("queryError", null) as ViewState)
+        );
+      } finally {
+        this.isInternalStateUpdate = false;
+      }
+    }
 
     this.pendingOffset = offset;
     this.pendingLimit = limit;
     this.pendingPage = safePage;
+    this.pendingIsPartialCache = isPartialCache;
+    this.pageSize = pSize;
 
     const requestDsPath = viewState.dsPath;
     const requestBaseQuery = viewState.baseQuery;
@@ -464,10 +621,14 @@ export class PivotRequester {
       limit,
       this.onViewQuery,
       safePage,
-      pSize
+      pSize,
+      isPartialCache
     );
     this.pendingDataRequest = dreq;
     dreq.then((dataView) => {
+      if (this.pendingDataRequest !== dreq) {
+        return dataView;
+      }
       this.pendingDataRequest = null;
       oneref.update(
         stateRef,
@@ -496,50 +657,84 @@ export class PivotRequester {
                 dataView.offset,
                 dataView.rawData,
                 safePage,
-                pSize
+                pSize,
+                dataView.isPartialCache
               );
             }
           }
-          return vs
-            .update("loadingTimer", (lt) => lt.stop())
-            .set("dataView", syncedDataView) as ViewState;
+          return (vs.update("loadingTimer", (lt) => lt.stop()) as ViewState)
+            .set("dataView", syncedDataView)
+            .set("queryError", null) as ViewState;
         })
       );
       this.setLoadingCallback(false);
       return dataView;
     }).catch((err) => {
+      if (this.pendingDataRequest !== dreq) {
+        return;
+      }
+      this.pendingDataRequest = null;
+      this.pendingLimit = 0;
+      this.pendingIsPartialCache = false;
+      const errMsg = err?.message || String(err);
+      const latestVs = mutableGet(stateRef).viewState;
+      const isStale =
+        !latestVs ||
+        (requestDsPath && JSON.stringify(latestVs.dsPath) !== JSON.stringify(requestDsPath)) ||
+        (requestBaseQuery && latestVs.baseQuery !== requestBaseQuery);
+      if (isStale) {
+        console.warn("PivotRequester: Ignoring stale data request error because active view changed.");
+        return;
+      }
       console.error(
         "PivotRequester: caught error fetching data view: ",
-        err.message,
-        err.stack
+        errMsg,
+        err?.stack
       );
       if (typeof window !== "undefined") {
         window.dispatchEvent(
           new CustomEvent("toad-query-error", {
-            detail: { message: err.message },
+            detail: { message: errMsg },
           })
         );
         window.dispatchEvent(
           new CustomEvent("tad-query-error", {
-            detail: { message: err.message },
+            detail: { message: errMsg },
           })
         );
       }
       this.setLoadingCallback(false);
-      oneref.update(
-        stateRef,
-        vsUpdate((vs: ViewState) =>
-          vs.update("loadingTimer", (lt) => lt.stop())
-        )
-      );
+      this.isInternalStateUpdate = true;
+      try {
+        oneref.update(
+          stateRef,
+          vsUpdate((vs: ViewState) => {
+            if (
+              (requestDsPath && JSON.stringify(vs.dsPath) !== JSON.stringify(requestDsPath)) ||
+              (requestBaseQuery && vs.baseQuery !== requestBaseQuery)
+            ) {
+              return vs;
+            }
+            return (vs.update("loadingTimer", (lt) => lt.stop()) as ViewState).set(
+              "queryError",
+              errMsg
+            ) as ViewState;
+          })
+        );
+      } finally {
+        this.isInternalStateUpdate = false;
+      }
       if (this.errorCallback) {
-        this.errorCallback(err instanceof Error ? err : new Error(err));
+        this.errorCallback(err instanceof Error ? err : new Error(errMsg));
       }
     });
     return dreq;
   }
 
   onStateChange(stateRef: oneref.StateRef<AppState>) {
+    if (this.isInternalStateUpdate) {
+      return;
+    }
     const appState: AppState = mutableGet(stateRef);
     const viewState = appState.viewState;
 
@@ -616,6 +811,10 @@ export class PivotRequester {
       }
       const requestDsPath = viewState.dsPath;
       const requestBaseQuery = viewState.baseQuery;
+      this.currentQueryView = null;
+      this.pendingOffset = 0;
+      this.pendingLimit = 0;
+      this.pendingIsPartialCache = false;
       // NOTE!  Very important to pass queryView (latest from appState) and not
       // this.currentQueryView, which may be stale.
       // TODO:  The sequencing and control flow here is really subtle; we should rework this to make
@@ -633,44 +832,70 @@ export class PivotRequester {
       this.pendingQueryRequest = qreq;
       this.pendingDataRequest = qreq
         .then((queryView) => {
+          if (this.pendingQueryRequest !== qreq) {
+            return null as any;
+          }
+          this.pendingQueryRequest = null;
           const curState: AppState = mutableGet(stateRef);
           if (
             curState.viewState &&
             ((requestDsPath && JSON.stringify(curState.viewState.dsPath) !== JSON.stringify(requestDsPath)) ||
              (requestBaseQuery && curState.viewState.baseQuery !== requestBaseQuery))
           ) {
-            console.warn("PivotRequester: Bo qua QueryView cu vi nguoi dung da chuyen view.");
+            console.warn("PivotRequester: Ignoring stale QueryView because active view changed.");
             return null as any;
           }
-          this.currentQueryView = queryView;
-          oneref.update(
-            stateRef,
-            vsUpdate((vs: ViewState) => {
-              /*
-               * queryView.rowCount may have changed since last data request;
-               * trim viewport to ensure its in range
-               */
-              const [viewportTop, viewportBottom] = paging.clampViewport(
-                queryView.rowCount,
-                vs.viewportTop,
-                vs.viewportBottom
-              );
-              return vs
-                .set("viewportTop", viewportTop)
-                .set("viewportBottom", viewportBottom)
-                .set("queryView", queryView) as ViewState;
-            })
-          );
+
           // Preloaded buffer reuse - avoid duplicate DuckDB queries when opening cached table
           const curVs = curState.viewState;
           const dv = curVs?.dataView;
           const vp = curVs?.viewParams;
           const baseSchema = curVs?.baseSchema;
           const pSize = curVs?.pageSize || this.pageSize || 1000;
-          const expectedLimit = Math.min(queryView.rowCount, pSize * 3);
+          const curPage = curVs?.currentPage || 1;
+
+          const INTERNAL_OR_REC = new Set(["Rec", "_depth", "_pivot", "_isRoot"]);
+          const normalizeCols = (cols: string[]) =>
+            cols.filter(
+              (c) => !INTERNAL_OR_REC.has(c) && !/^_sortVal_\d+$/.test(c)
+            );
+          const dvCols = dv?.schema?.columns ? normalizeCols(dv.schema.columns) : [];
+          const effectiveSortKey = baseSchema
+            ? computeEffectiveSortKey(
+                baseSchema,
+                vp || new ViewParams(),
+                queryView.baseRowCount
+              )
+            : undefined;
+          const allProjectedCols = baseSchema
+            ? computeProjectedColumns(
+                baseSchema,
+                vp || new ViewParams(),
+                effectiveSortKey
+              )
+            : [];
+          const prunedCols = normalizeCols(allProjectedCols);
+          const colsMatch =
+            dvCols.length > 0 &&
+            dvCols.length === prunedCols.length &&
+            dvCols.every((c: string, i: number) => c === prunedCols[i]);
+
+          const projColCount = Math.max(1, allProjectedCols.length || 1);
+          const maxRowsByBudget = Math.max(
+            100,
+            Math.floor(ADAPTIVE_CELL_BUDGET / projColCount)
+          );
+          const expectedLimit = Math.min(
+            queryView.rowCount,
+            pSize,
+            maxRowsByBudget
+          );
 
           const canReusePreloadedBuffer =
-            !baseQueryChanged &&
+            curVs != null &&
+            curVs.baseQuery === requestBaseQuery &&
+            curVs.queryView == null &&
+            curPage === 1 &&
             dv != null &&
             dv.rawData &&
             dv.rawData.length > 0 &&
@@ -678,88 +903,185 @@ export class PivotRequester {
             dv.currentPage === 1 &&
             dv.pageSize === pSize &&
             dv.rawData.length >= expectedLimit &&
-            (!vp || (vp.vpivots.length === 0 && vp.filterExp.opArgs.length === 0)) &&
-            dv.schema &&
-            baseSchema &&
-            dv.schema.columns &&
-            baseSchema.columns &&
-            dv.schema.columns.length === baseSchema.columns.length &&
-            dv.schema.columns.every((c: string, i: number) => c === baseSchema.columns[i]);
+            (!vp ||
+              (vp.vpivots.length === 0 &&
+                vp.filterExp.opArgs.length === 0 &&
+                (!effectiveSortKey || effectiveSortKey.length === 0))) &&
+            colsMatch;
+
+          this.currentQueryView = queryView;
 
           if (canReusePreloadedBuffer) {
             this.pendingDataRequest = null;
             this.pendingOffset = dv.offset;
             this.pendingLimit = dv.rawData.length;
             this.pendingPage = 1;
+            this.pendingIsPartialCache = Boolean(dv.isPartialCache);
             this.pageSize = pSize;
             this.setLoadingCallback(false);
+            this.isInternalStateUpdate = true;
+            try {
+              oneref.update(
+                stateRef,
+                vsUpdate((vs: ViewState) => {
+                  const [viewportTop, viewportBottom] = paging.clampViewport(
+                    queryView.rowCount,
+                    vs.viewportTop,
+                    vs.viewportBottom
+                  );
+                  return (vs.update("loadingTimer", (lt) => lt.stop()) as ViewState)
+                    .set("viewportTop", viewportTop)
+                    .set("viewportBottom", viewportBottom)
+                    .set("queryView", queryView)
+                    .set("queryError", null) as ViewState;
+                })
+              );
+            } finally {
+              this.isInternalStateUpdate = false;
+            }
+            return dv;
+          }
+
+          this.isInternalStateUpdate = true;
+          try {
             oneref.update(
               stateRef,
-              vsUpdate((vs: ViewState) =>
-                vs.update("loadingTimer", (lt) => lt.stop())
-              )
+              vsUpdate((vs: ViewState) => {
+                /*
+                 * queryView.rowCount may have changed since last data request;
+                 * trim viewport to ensure its in range
+                 */
+                const [viewportTop, viewportBottom] = paging.clampViewport(
+                  queryView.rowCount,
+                  vs.viewportTop,
+                  vs.viewportBottom
+                );
+                return vs
+                  .set("viewportTop", viewportTop)
+                  .set("viewportBottom", viewportBottom)
+                  .set("queryView", queryView)
+                  .set("queryError", null) as ViewState;
+              })
             );
-            return dv;
+          } finally {
+            this.isInternalStateUpdate = false;
           }
 
           return this.sendDataRequest(stateRef, queryView);
         })
         .catch((err) => {
+          if (this.pendingQueryRequest !== qreq) {
+            return;
+          }
+          this.pendingQueryRequest = null;
+          const errMsg = err?.message || String(err);
+          const curState: AppState = mutableGet(stateRef);
+          const curVs = curState.viewState;
+          const isStale =
+            !curVs ||
+            (requestDsPath && JSON.stringify(curVs.dsPath) !== JSON.stringify(requestDsPath)) ||
+            (requestBaseQuery && curVs.baseQuery !== requestBaseQuery);
+          if (isStale) {
+            console.warn("PivotRequester: Ignoring stale QueryView error because active view changed.");
+            return;
+          }
           console.error(
             "PivotRequester: caught error updating view: ",
-            err.message,
-            err.stack
+            errMsg,
+            err?.stack
           );
           if (typeof window !== "undefined") {
             window.dispatchEvent(
               new CustomEvent("toad-query-error", {
-                detail: { message: err.message },
+                detail: { message: errMsg },
               })
             );
             window.dispatchEvent(
               new CustomEvent("tad-query-error", {
-                detail: { message: err.message },
+                detail: { message: errMsg },
               })
             );
           }
           this.setLoadingCallback(false);
           // TODO:
           // remoteErrorDialog("Error constructing view", err.message); // Now let's try and restore to previous view params:
-          oneref.update(
-            stateRef,
-            vsUpdate((vs: ViewState) =>
-              vs.update("loadingTimer", (lt) => lt.stop())
-            )
-          );
+          this.isInternalStateUpdate = true;
+          try {
+            oneref.update(
+              stateRef,
+              vsUpdate((vs: ViewState) => {
+                if (
+                  (requestDsPath && JSON.stringify(vs.dsPath) !== JSON.stringify(requestDsPath)) ||
+                  (requestBaseQuery && vs.baseQuery !== requestBaseQuery)
+                ) {
+                  return vs;
+                }
+                return (vs.update("loadingTimer", (lt) => lt.stop()) as ViewState).set(
+                  "queryError",
+                  errMsg
+                ) as ViewState;
+              })
+            );
+          } finally {
+            this.isInternalStateUpdate = false;
+          }
           if (this.errorCallback) {
-            this.errorCallback(err instanceof Error ? err : new Error(err));
+            this.errorCallback(err instanceof Error ? err : new Error(errMsg));
           }
         });
       const ltUpdater = util.pathUpdater<AppState, Timer>(stateRef, [
         "viewState",
         "loadingTimer",
       ]);
-      const nextAppState = appState.updateIn(
-        ["viewState", "loadingTimer"],
-        (lt) => (lt as Timer).run(200, ltUpdater as unknown as TimerUpdater)
-      ) as AppState;
-      oneref.update(stateRef, (_) => nextAppState);
+      const nextAppState = appState
+        .updateIn(["viewState", "loadingTimer"], (lt) =>
+          (lt as Timer).run(200, ltUpdater as unknown as TimerUpdater)
+        )
+        .setIn(["viewState", "queryError"], null) as AppState;
+      this.isInternalStateUpdate = true;
+      try {
+        oneref.update(stateRef, (_) => nextAppState);
+      } finally {
+        this.isInternalStateUpdate = false;
+      }
     } else {
-      const curPage = viewState.currentPage || 1;
+      const rawCurPage = viewState.currentPage || 1;
       const pSize = viewState.pageSize || 1000;
+      const totalRowCount = this.currentQueryView?.rowCount ?? Infinity;
+      const totalPages = Number.isFinite(totalRowCount)
+        ? Math.max(1, Math.ceil(totalRowCount / pSize))
+        : rawCurPage;
+      const curPage = Math.min(Math.max(1, rawCurPage), totalPages);
       const pageStartRow = (curPage - 1) * pSize;
       const pageEndRow = pageStartRow + pSize;
 
       // Check if current page is outside the loaded buffer range or pageSize changed:
-      const totalRowCount = this.currentQueryView?.rowCount ?? Infinity;
       const effectiveEndRow = Math.min(pageEndRow, totalRowCount);
-      const bufferOutOfRange =
-        pageStartRow < this.pendingOffset ||
-        effectiveEndRow > this.pendingOffset + this.pendingLimit;
       const pageSizeChanged = pSize !== this.pageSize;
+      const partialPageSatisfied =
+        this.pendingIsPartialCache &&
+        curPage === this.pendingPage &&
+        !pageSizeChanged &&
+        pageStartRow >= this.pendingOffset &&
+        pageStartRow < this.pendingOffset + this.pendingLimit;
+      const bufferOutOfRange =
+        !partialPageSatisfied &&
+        (pageStartRow < this.pendingOffset ||
+          effectiveEndRow > this.pendingOffset + this.pendingLimit);
       this.pageSize = pSize;
 
-      if (this.currentQueryView !== null && (bufferOutOfRange || pageSizeChanged)) {
+      if (
+        this.currentQueryView !== null &&
+        this.pendingQueryRequest == null &&
+        (bufferOutOfRange || pageSizeChanged)
+      ) {
+        if (
+          viewState.queryError != null &&
+          curPage === this.pendingPage &&
+          !pageSizeChanged
+        ) {
+          return;
+        }
         const qv: QueryView = this.currentQueryView as any;
         this.sendDataRequest(stateRef, qv);
       }

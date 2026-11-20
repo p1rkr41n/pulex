@@ -460,16 +460,99 @@ export const AppPane: React.FunctionComponent<AppPaneProps> = ({
   const [expandedEvent, setExpandedEvent] = useState<{
     rowData: DataRow;
     rowIndex: number;
+    isLoadingFullRow?: boolean;
+    fullRowError?: string | null;
   } | null>(null);
+  const expandRequestIdRef = useRef(0);
+  const lastQueryErrorToastRef = useRef<{ msg: string; at: number }>({
+    msg: "",
+    at: 0,
+  });
 
   const handleExpandEvent = useCallback(
-    (rowData: DataRow, rowIndex: number, forceOpen?: boolean) => {
-      setExpandedEvent({ rowData, rowIndex });
+    (rowData: DataRow, rowIndex: number, _forceOpen?: boolean) => {
+      const reqId = ++expandRequestIdRef.current;
+      const curVs = mutableGet(stateRef).viewState;
+      const hasMissingSchemaCols = curVs?.baseSchema?.columns
+        ? curVs.baseSchema.columns.some(
+            (c) =>
+              c !== "Rec" &&
+              !Object.prototype.hasOwnProperty.call(rowData || {}, c)
+          )
+        : false;
+      const needsFullRow =
+        rowIndex >= 0 &&
+        curVs != null &&
+        curVs.baseSchema != null &&
+        curVs.queryView?.fullRowQuery != null &&
+        curVs.dbc != null &&
+        hasMissingSchemaCols;
+
+      if (!needsFullRow) {
+        setExpandedEvent({
+          rowData,
+          rowIndex,
+          isLoadingFullRow: false,
+          fullRowError: null,
+        });
+        return;
+      }
+
+      setExpandedEvent({
+        rowData,
+        rowIndex,
+        isLoadingFullRow: true,
+        fullRowError: null,
+      });
+
+      const globalRowIndex0Based =
+        ((curVs.currentPage || 1) - 1) * (curVs.pageSize || 1000) + rowIndex;
+
+      curVs.dbc
+        .evalQuery(curVs.queryView!.fullRowQuery!, globalRowIndex0Based, 1)
+        .then((res) => {
+          if (reqId !== expandRequestIdRef.current) return;
+          if (res?.rowData && res.rowData.length > 0) {
+            setExpandedEvent((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    rowData: { ...prev.rowData, ...res.rowData[0] },
+                    isLoadingFullRow: false,
+                    fullRowError: null,
+                  }
+                : null
+            );
+          } else {
+            setExpandedEvent((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    isLoadingFullRow: false,
+                  }
+                : null
+            );
+          }
+        })
+        .catch((err) => {
+          if (reqId !== expandRequestIdRef.current) return;
+          const errMsg = err?.message || String(err);
+          setExpandedEvent((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  isLoadingFullRow: false,
+                  fullRowError: errMsg,
+                }
+              : null
+          );
+        });
     },
-    []
+    [stateRef]
   );
 
   const handleCloseDetail = useCallback(() => {
+    expandRequestIdRef.current++;
     setExpandedEvent(null);
   }, []);
 
@@ -493,6 +576,7 @@ export const AppPane: React.FunctionComponent<AppPaneProps> = ({
 
   // Collapse event detail panel if data source path or page changes
   useEffect(() => {
+    expandRequestIdRef.current++;
     setExpandedEvent(null);
   }, [dsPath, viewState?.currentPage]);
 
@@ -509,12 +593,55 @@ export const AppPane: React.FunctionComponent<AppPaneProps> = ({
   }, []);
 
   // Trigger grid resize when detail panel toggles
+  const isDetailExpanded = expandedEvent !== null;
   useEffect(() => {
     const timer = setTimeout(() => {
       window.dispatchEvent(new Event("resize"));
     }, 60);
     return () => clearTimeout(timer);
-  }, [expandedEvent]);
+  }, [isDetailExpanded]);
+
+  // Global query error toast listener (active even when Filter panel is closed)
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handleQueryError = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      const msg =
+        (detail && typeof detail.message === "string" && detail.message.trim()) ||
+        "DuckDB query error";
+      const now = Date.now();
+      if (
+        lastQueryErrorToastRef.current.msg === msg &&
+        now - lastQueryErrorToastRef.current.at < 1500
+      ) {
+        return;
+      }
+      lastQueryErrorToastRef.current = { msg, at: now };
+      try {
+        const toaster = getAppToaster();
+        if (toaster) {
+          toaster.show({
+            message: msg,
+            intent: Intent.DANGER,
+            icon: "error",
+            timeout: 8000,
+            action: {
+              text: "Retry",
+              onClick: () => {
+                actions.reopenCurrentView(stateRef);
+              },
+            },
+          });
+        }
+      } catch (toastErr) {
+        console.error("[AppPane] Error displaying query error toast:", toastErr);
+      }
+    };
+    window.addEventListener("toad-query-error", handleQueryError);
+    return () => {
+      window.removeEventListener("toad-query-error", handleQueryError);
+    };
+  }, [stateRef]);
 
   // Engine Auto-Recovery: BlueprintJS v4 non-blocking toast & view refresh
   useEffect(() => {
@@ -674,6 +801,9 @@ export const AppPane: React.FunctionComponent<AppPaneProps> = ({
                 expandedEvent.rowIndex +
                 1
               }
+              isLoadingFullRow={expandedEvent.isLoadingFullRow}
+              totalSchemaCols={viewState.baseSchema?.columns.length}
+              fullRowError={expandedEvent.fullRowError}
               onClose={handleCloseDetail}
               clipboard={clipboard}
               onAddFilter={handleAddFilterFromDetail}
@@ -705,19 +835,37 @@ export const AppPane: React.FunctionComponent<AppPaneProps> = ({
           "dataset";
       }
     }
-    centerPane = (
-      <div className="center-app-pane center-loading-pane">
-        <div className="main-loading-card">
-          <div className="main-loading-spinner-wrap">
-            <Spinner size={48} intent="primary" />
+    if (viewState.queryError) {
+      centerPane = (
+        <div className="center-app-pane center-error-pane">
+          <div className="main-error-card">
+            <Icon icon="error" iconSize={40} intent="danger" />
+            <h3 className="main-error-title">Error opening {fileName}</h3>
+            <p className="main-error-desc">{viewState.queryError}</p>
+            <Button
+              intent="primary"
+              icon="refresh"
+              text="Retry"
+              onClick={() => actions.reopenCurrentView(stateRef)}
+            />
           </div>
-          <h3 className="main-loading-title">Opening {fileName}...</h3>
-          <p className="main-loading-subtitle">
-            Fetching dataset rows and calculating metrics...
-          </p>
         </div>
-      </div>
-    );
+      );
+    } else {
+      centerPane = (
+        <div className="center-app-pane center-loading-pane">
+          <div className="main-loading-card">
+            <div className="main-loading-spinner-wrap">
+              <Spinner size={48} intent="primary" />
+            </div>
+            <h3 className="main-loading-title">Opening {fileName}...</h3>
+            <p className="main-loading-subtitle">
+              Fetching dataset rows and calculating metrics...
+            </p>
+          </div>
+        </div>
+      );
+    }
   } else {
     pivotSidebar = null;
     centerPane = (

@@ -6,6 +6,7 @@
 
 use crate::engine::DuckDbEnginePool;
 use crate::portable::{save_config, ToadConfig};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -47,7 +48,8 @@ pub struct AppState {
     pub duckdb_engine: Arc<RwLock<DuckDbEnginePlaceholder>>,
     pub parquet_ledger: Arc<RwLock<ParquetLedger>>,
     pub ingest_queue: Arc<RwLock<IngestionScheduler>>,
-    pub derived_views: Arc<RwLock<std::collections::HashMap<String, DerivedViewSpec>>>,
+    pub derived_views: Arc<RwLock<HashMap<String, DerivedViewSpec>>>,
+    pub view_parquet_paths: Arc<RwLock<HashMap<String, PathBuf>>>,
 }
 
 impl AppState {
@@ -115,6 +117,7 @@ impl AppState {
             parquet_ledger: ledger_arc,
             ingest_queue: Arc::new(RwLock::new(scheduler)),
             derived_views: Arc::new(RwLock::new(initial_derived)),
+            view_parquet_paths: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -145,6 +148,68 @@ impl AppState {
     pub async fn get_derived_view(&self, view_name: &str) -> Option<DerivedViewSpec> {
         let map = self.derived_views.read().await;
         map.get(view_name).cloned()
+    }
+
+    /// Register a backing Parquet file path for a DuckDB view name (e.g., `tbl_<hash>`, `main_table`)
+    pub async fn register_view_parquet_path(&self, view_name: String, parquet_path: PathBuf) {
+        let mut map = self.view_parquet_paths.write().await;
+        map.insert(view_name, parquet_path);
+    }
+
+    /// Look up the backing Parquet file path for a DuckDB view name
+    pub async fn get_view_parquet_path(&self, view_name: &str) -> Option<PathBuf> {
+        let map = self.view_parquet_paths.read().await;
+        map.get(view_name).cloned()
+    }
+
+    /// Remove a stale view-to-parquet mapping
+    pub async fn remove_view_parquet_path(&self, view_name: &str) {
+        let mut map = self.view_parquet_paths.write().await;
+        map.remove(view_name);
+    }
+
+    /// Clear all view-to-parquet mappings (e.g. after Delete All Projects)
+    pub async fn clear_all_view_parquet_paths(&self) {
+        let mut map = self.view_parquet_paths.write().await;
+        map.clear();
+    }
+
+    /// Remove view-to-parquet mappings pointing inside a specific project temp directory.
+    /// Returns the list of affected view names (e.g. `tbl_<hash>`, `main_table`).
+    pub async fn remove_view_parquet_paths_for_project(
+        &self,
+        project_temp_dir: &std::path::Path,
+    ) -> Vec<String> {
+        let mut map = self.view_parquet_paths.write().await;
+        let stale_views: Vec<String> = map
+            .iter()
+            .filter(|(_, pq)| pq.starts_with(project_temp_dir))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &stale_views {
+            map.remove(k);
+        }
+        stale_views
+    }
+
+    /// Remove view-to-parquet mappings matching a specific Parquet file path.
+    pub async fn remove_view_parquet_paths_for_file(
+        &self,
+        parquet_path: &std::path::Path,
+    ) -> Vec<String> {
+        let mut map = self.view_parquet_paths.write().await;
+        let target_norm = parquet_path.to_string_lossy().replace('\\', "/").to_lowercase();
+        let stale_views: Vec<String> = map
+            .iter()
+            .filter(|(_, pq)| {
+                pq.to_string_lossy().replace('\\', "/").to_lowercase() == target_norm
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &stale_views {
+            map.remove(k);
+        }
+        stale_views
     }
 
     /// Retrieve or lazily initialize the DuckDB Engine Pool
@@ -226,6 +291,33 @@ mod tests {
 
         let reread = state.get_config().await;
         assert_eq!(reread.general.page_size, 2000);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_view_parquet_path_invalidation_per_project_and_all() {
+        let temp_dir = std::env::temp_dir().join(format!("pulex_test_state_inv_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let state = AppState::new(temp_dir.clone(), ToadConfig::default());
+        let p1_dir = temp_dir.join("temp").join("rp2i6");
+        let p2_dir = temp_dir.join("temp").join("rptme");
+
+        state
+            .register_view_parquet_path("tbl_17f24271".to_string(), p1_dir.join("test_all_cached_17f24271.parquet"))
+            .await;
+        state
+            .register_view_parquet_path("tbl_e5609dd9".to_string(), p2_dir.join("output_1000_cached_e5609dd9.parquet"))
+            .await;
+
+        let removed = state.remove_view_parquet_paths_for_project(&p1_dir).await;
+        assert_eq!(removed, vec!["tbl_17f24271".to_string()]);
+        assert!(state.get_view_parquet_path("tbl_17f24271").await.is_none());
+        assert!(state.get_view_parquet_path("tbl_e5609dd9").await.is_some());
+
+        state.clear_all_view_parquet_paths().await;
+        assert!(state.get_view_parquet_path("tbl_e5609dd9").await.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

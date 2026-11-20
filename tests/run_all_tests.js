@@ -46,6 +46,11 @@ const SUITES = [
     file: "test_v30_pulex_upgrade.js",
     description: "Verifies XSS/CSP guards, 20-line ceiling, limit=0 guard, command aliases, and English-only policy",
   },
+  {
+    name: "Wide-Table & Laptop Peak Protection Suite",
+    file: "test_wide_table_protection.js",
+    description: "Verifies PagedDataView partial cache clamping, computeProjectedColumns, and MultipleLoadingManager LRU byte cap",
+  },
 ];
 
 function main() {

@@ -1013,3 +1013,84 @@ impl QueryExpCompiler {
         format!("\"{}\"", ident.replace('"', "\"\""))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_project_after_filter_and_sort_with_hidden_filter_column_on_duckdb() {
+        let query = QueryRep::Project {
+            cols: vec!["id".to_string(), "msg".to_string()],
+            from: Box::new(QueryRep::Sort {
+                keys: vec![SortKey::Tuple("ts".to_string(), false)],
+                from: Box::new(QueryRep::Filter {
+                    fexp: FilterExp::Single(SubExp::BinRel(BinRelExp {
+                        exp_type: "BinRelExp".to_string(),
+                        op: "EQ".to_string(),
+                        lhs: ValExp::Typed(TypedValExp::ColRef {
+                            col_name: "hidden_tag".to_string(),
+                            tbl_alias: None,
+                        }),
+                        rhs: ValExp::Typed(TypedValExp::ConstVal {
+                            val: Value::String("keep".to_string()),
+                        }),
+                    })),
+                    from: Box::new(QueryRep::Table {
+                        table_name: "events".to_string(),
+                    }),
+                }),
+            }),
+        };
+
+        let sql = QueryExpCompiler::compile(&query, Some(0), Some(10))
+            .expect("Compile Project after Sort + Filter");
+        assert!(sql.contains("WHERE"), "Expected WHERE clause in SQL: {}", sql);
+        assert!(sql.contains("ORDER BY"), "Expected ORDER BY clause in SQL: {}", sql);
+        assert!(
+            sql.starts_with("SELECT \"id\", \"msg\" FROM"),
+            "Expected outer projection of only [id, msg], got: {}",
+            sql
+        );
+
+        let conn = duckdb::Connection::open_in_memory().expect("open in-memory DuckDB");
+        conn.execute_batch(
+            "CREATE TABLE events (id INTEGER, ts INTEGER, msg VARCHAR, hidden_tag VARCHAR);
+             INSERT INTO events VALUES
+               (1, 100, 'first-keep', 'keep'),
+               (2, 300, 'drop-me', 'drop'),
+               (3, 200, 'second-keep', 'keep'),
+               (4, 400, 'latest-keep', 'keep');",
+        )
+        .expect("seed events table");
+
+        let mut stmt = conn.prepare(&sql).expect("prepare compiled SQL");
+        let mut rows = stmt.query([]).expect("execute compiled SQL");
+
+        let col_names: Vec<String> = rows
+            .as_ref()
+            .expect("rows statement ref")
+            .column_names()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(col_names, vec!["id".to_string(), "msg".to_string()]);
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().expect("read row") {
+            let id: i32 = row.get(0).expect("id col");
+            let msg: String = row.get(1).expect("msg col");
+            results.push((id, msg));
+        }
+
+        // Filtered to hidden_tag == 'keep', sorted by ts DESC (400 -> id 4, 200 -> id 3, 100 -> id 1)
+        assert_eq!(
+            results,
+            vec![
+                (4, "latest-keep".to_string()),
+                (3, "second-keep".to_string()),
+                (1, "first-keep".to_string()),
+            ]
+        );
+    }
+}

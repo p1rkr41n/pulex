@@ -377,6 +377,9 @@ export class ProjectWorkspaceManager {
         this.expandedMap.clear();
         this.cachedProjects = [];
         this.activeProjectId = "";
+        try {
+          MultipleLoadingManager.getInstance().clearAllItems();
+        } catch { }
         this.notify();
         return result;
       } catch { }
@@ -535,10 +538,23 @@ export class ProjectWorkspaceManager {
   public async purgeProjectCache(
     projectId: string
   ): Promise<{ purgedFiles: number; freedBytes: number }> {
+    let projectFilePaths: string[] = [];
+    try {
+      const files = await this.getProjectFiles(projectId);
+      projectFilePaths = files.map((f) => f.filePath).filter(Boolean);
+    } catch { }
+
     const bridge = getBridge();
     if (bridge && typeof bridge.invoke === "function") {
       try {
         const res = await bridge.invoke("project:purgeCache", { projectId });
+        try {
+          if (projectFilePaths.length > 0) {
+            MultipleLoadingManager.getInstance().invalidateFilesCache(projectFilePaths);
+          } else {
+            MultipleLoadingManager.getInstance().clearFirstPageCache();
+          }
+        } catch { }
         this.notify();
         return res;
       } catch { }

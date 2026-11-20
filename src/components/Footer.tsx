@@ -6,7 +6,7 @@ import { AppState } from "../AppState";
 import { StateRef } from "oneref";
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { getDefaultDialect } from "reltab";
-import { Button } from "@blueprintjs/core";
+import { Button, Spinner, Tag, Intent } from "@blueprintjs/core";
 import { ParseSplitIcon } from "./icons/ParseSplitIcon";
 
 export interface FooterControl {
@@ -234,6 +234,7 @@ export const Footer: React.FunctionComponent<FooterProps> = (
 
   let pagerBlock = null;
   let rowCountBlock = null;
+  let statusBlock = null;
   const queryView = appState.viewState?.queryView;
   if (queryView) {
     const numFmt = (num: number) =>
@@ -353,6 +354,61 @@ export const Footer: React.FunctionComponent<FooterProps> = (
         </div>
       </div>
     );
+  } else {
+    if (vs?.queryError) {
+      statusBlock = (
+        <div
+          className="footer-block footer-error-block"
+          style={{ display: "flex", alignItems: "center", gap: 6, maxWidth: 420 }}
+        >
+          <Tag
+            intent={Intent.DANGER}
+            icon="error"
+            minimal
+            title={vs.queryError}
+            style={{ maxWidth: 320 }}
+          >
+            <span
+              style={{
+                display: "inline-block",
+                maxWidth: 280,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                verticalAlign: "bottom",
+              }}
+            >
+              {vs.queryError}
+            </span>
+          </Tag>
+          <Button
+            small
+            minimal
+            intent={Intent.PRIMARY}
+            icon="refresh"
+            text="Retry"
+            onClick={() => actions.reopenCurrentView(stateRef)}
+          />
+        </div>
+      );
+    } else {
+      const totalRows = vs?.dataView?.totalRowCount;
+      statusBlock = (
+        <div
+          className="footer-block footer-loading-block"
+          style={{ display: "flex", alignItems: "center", gap: 6 }}
+        >
+          <Spinner size={12} />
+          <span className="pager-label">Loading page...</span>
+          {typeof totalRows === "number" && (
+            <span className="footer-value">
+              ({totalRows.toLocaleString(undefined, { useGrouping: true })} row
+              {totalRows === 1 ? "" : "s"})
+            </span>
+          )}
+        </div>
+      );
+    }
   }
 
   return (
@@ -404,6 +460,7 @@ export const Footer: React.FunctionComponent<FooterProps> = (
         <div className="footer-right-block">
           {pagerBlock}
           {rowCountBlock}
+          {statusBlock}
           {rightFooterSlot}
         </div>
       </div>

@@ -30,14 +30,57 @@ export interface FileIngestItem {
   version: number;
 }
 
+export const MAX_FIRST_PAGE_CACHE_BYTES = 48 * 1024 * 1024;
+export const MAX_SINGLE_CACHE_ENTRY_BYTES = 16 * 1024 * 1024;
+export const MAX_FIRST_PAGE_CACHE_ENTRIES = 12;
+
+export function estimateTableRepBytes(tableRep: reltab.TableRep): number {
+  if (!tableRep || !tableRep.rowData || tableRep.rowData.length === 0) {
+    return 0;
+  }
+  const rowCount = tableRep.rowData.length;
+  const cols =
+    tableRep.schema && tableRep.schema.columns && tableRep.schema.columns.length > 0
+      ? tableRep.schema.columns
+      : Object.keys(tableRep.rowData[0] || {});
+  const sampleCount = Math.min(rowCount, 50);
+  const step = Math.max(1, Math.floor(rowCount / sampleCount));
+  let sampledRows = 0;
+  let sampledBytes = 0;
+
+  for (let i = 0; i < rowCount && sampledRows < sampleCount; i += step) {
+    const row = tableRep.rowData[i];
+    sampledRows++;
+    sampledBytes += 64; // per-row JS object overhead
+    if (!row) continue;
+    for (let c = 0; c < cols.length; c++) {
+      const val = (row as any)[cols[c]];
+      if (typeof val === "string") {
+        sampledBytes += val.length * 2 + 24;
+      } else if (val instanceof Uint8Array) {
+        sampledBytes += val.byteLength + 24;
+      } else {
+        sampledBytes += 16;
+      }
+    }
+  }
+
+  if (sampledRows === 0) {
+    return 0;
+  }
+  return Math.ceil((sampledBytes / sampledRows) * rowCount);
+}
+
 export interface FirstPageCacheEntry {
   tableName: string;
   schema: reltab.Schema;
+  fullSchema?: reltab.Schema;
   tableRep: reltab.TableRep;
   totalRowCount: number;
   pageSize: number;
   bufferPages: number;
   cachedAt: number;
+  estimatedBytes?: number;
 }
 
 export type QueueChangeListener = () => void;
@@ -257,24 +300,63 @@ export class MultipleLoadingManager {
 
   public setFirstPageCache(keyOrCanon: string, entry: FirstPageCacheEntry): void {
     const key = this.resolveCacheKey(keyOrCanon);
-    if (!this.firstPageCache.has(key)) {
-      while (this.firstPageCache.size >= 30) {
-        let oldestKey: string | null = null;
-        let oldestTime = Infinity;
-        for (const [k, v] of this.firstPageCache.entries()) {
-          if (v.cachedAt < oldestTime) {
-            oldestTime = v.cachedAt;
-            oldestKey = k;
-          }
-        }
-        if (oldestKey) {
-          this.firstPageCache.delete(oldestKey);
-        } else {
-          break;
+    const entryBytes =
+      typeof entry.estimatedBytes === "number" && entry.estimatedBytes >= 0
+        ? entry.estimatedBytes
+        : estimateTableRepBytes(entry.tableRep);
+
+    if (entryBytes > MAX_SINGLE_CACHE_ENTRY_BYTES) {
+      log.warn(
+        `[MultipleLoading] Skipping RAM cache for ${entry.tableName}: estimated ${(entryBytes / (1024 * 1024)).toFixed(2)} MB exceeds ${(MAX_SINGLE_CACHE_ENTRY_BYTES / (1024 * 1024)).toFixed(0)} MB single-entry limit`
+      );
+      if (this.firstPageCache.has(key)) {
+        this.firstPageCache.delete(key);
+      }
+      return;
+    }
+
+    // Remove existing entry for this key first to avoid double-counting bytes on overwrite
+    if (this.firstPageCache.has(key)) {
+      this.firstPageCache.delete(key);
+    }
+
+    const getEntryBytes = (e: FirstPageCacheEntry): number =>
+      typeof e.estimatedBytes === "number" && e.estimatedBytes >= 0
+        ? e.estimatedBytes
+        : estimateTableRepBytes(e.tableRep);
+
+    let totalBytes = 0;
+    for (const v of this.firstPageCache.values()) {
+      totalBytes += getEntryBytes(v);
+    }
+
+    while (
+      this.firstPageCache.size >= MAX_FIRST_PAGE_CACHE_ENTRIES ||
+      totalBytes + entryBytes > MAX_FIRST_PAGE_CACHE_BYTES
+    ) {
+      let oldestKey: string | null = null;
+      let oldestTime = Infinity;
+      let oldestBytes = 0;
+      for (const [k, v] of this.firstPageCache.entries()) {
+        if (v.cachedAt < oldestTime) {
+          oldestTime = v.cachedAt;
+          oldestKey = k;
+          oldestBytes = getEntryBytes(v);
         }
       }
+      if (oldestKey !== null) {
+        this.firstPageCache.delete(oldestKey);
+        totalBytes = Math.max(0, totalBytes - oldestBytes);
+      } else {
+        break;
+      }
     }
-    this.firstPageCache.set(key, entry);
+
+    const storedEntry: FirstPageCacheEntry = {
+      ...entry,
+      estimatedBytes: entryBytes,
+    };
+    this.firstPageCache.set(key, storedEntry);
   }
 
   public clearFirstPageCache(targetKeyOrPath?: string): void {
@@ -300,6 +382,44 @@ export class MultipleLoadingManager {
     this.files.delete(filePathOrKey);
     this.activeItems.delete(filePathOrKey);
     this.clearFirstPageCache(filePathOrKey);
+    this.notify();
+  }
+
+  /**
+   * Reset all queued files and RAM micro-caches (used after Delete All Projects).
+   */
+  public clearAllItems(): void {
+    this.files.clear();
+    this.canonicalMap.clear();
+    this.activeItems.clear();
+    this.firstPageCache.clear();
+    this.pendingActiveOpenKey = null;
+    this.notify();
+  }
+
+  /**
+   * Invalidate RAM micro-caches and reset ready state for purged project files.
+   */
+  public invalidateFilesCache(filePaths: string[]): void {
+    for (const fp of filePaths) {
+      if (!fp) continue;
+      this.clearFirstPageCache(fp);
+      const canon = fp.replace(/[\/\\]+/g, "\\").toLowerCase();
+      const keySet = this.canonicalMap.get(canon);
+      if (keySet) {
+        for (const k of keySet) {
+          const item = this.files.get(k);
+          if (item && item.status === "ready") {
+            this.files.set(k, {
+              ...item,
+              status: "modified",
+              percent: 0,
+              version: (item.version || 0) + 1,
+            });
+          }
+        }
+      }
+    }
     this.notify();
   }
 
@@ -959,27 +1079,28 @@ export class MultipleLoadingManager {
         }
 
         const totalRowCount = await processingItem.dsc.rowCount(baseQuery);
-        let preloadLimit: number;
-        let bufferPages = 3;
+        const effectiveColCount = schema && colCount > 100 ? 100 : colCount;
+        const preloadQuery =
+          schema && colCount > 100
+            ? baseQuery.project(schema.columns.slice(0, 100))
+            : baseQuery;
 
-        if (colCount <= 50) {
-          bufferPages = 3;
-          preloadLimit = Math.min(totalRowCount, pSize * 3);
-        } else if (colCount <= 200) {
-          bufferPages = 1;
-          preloadLimit = Math.min(totalRowCount, pSize * 1);
-        } else {
-          bufferPages = 1;
-          preloadLimit = Math.min(
-            totalRowCount,
-            Math.max(100, Math.floor(150000 / colCount))
-          );
-        }
+        const maxRowsByCellBudget = Math.max(
+          100,
+          Math.floor(250_000 / Math.max(1, effectiveColCount))
+        );
+        const bufferPages = effectiveColCount <= 50 ? 3 : 1;
+        const preloadLimit = Math.min(
+          totalRowCount,
+          pSize * bufferPages,
+          maxRowsByCellBudget
+        );
 
-        const tableRep = await processingItem.dsc.evalQuery(baseQuery, 0, preloadLimit);
+        const tableRep = await processingItem.dsc.evalQuery(preloadQuery, 0, preloadLimit);
         const cacheEntry: FirstPageCacheEntry = {
           tableName,
           schema: tableRep.schema,
+          fullSchema: schema || tableRep.schema,
           tableRep,
           totalRowCount,
           pageSize: pSize,
@@ -1122,34 +1243,42 @@ export class MultipleLoadingManager {
           (await it.dsc.getTableName(it.dsPath, { isBackground: true } as any));
         const baseQuery = reltab.tableQuery(tableName);
 
-        let colCount = existing?.schema?.columns ? existing.schema.columns.length : 0;
-        if (!colCount && typeof it.dsc.getTableSchema === "function") {
+        let schema: reltab.Schema | undefined = existing?.fullSchema || existing?.schema;
+        if (!existing?.fullSchema && typeof it.dsc.getTableSchema === "function") {
           try {
             const sc = await it.dsc.getTableSchema(tableName);
             if (sc && sc.columns) {
-              colCount = sc.columns.length;
+              schema = sc;
+            }
+          } catch {}
+        } else if (!schema && typeof (it.dsc as any).getSchema === "function") {
+          try {
+            const sc = await (it.dsc as any).getSchema(baseQuery);
+            if (sc && sc.columns) {
+              schema = sc;
             }
           } catch {}
         }
+        const colCount = schema?.columns ? schema.columns.length : 0;
+        const effectiveColCount = schema && colCount > 100 ? 100 : colCount;
+        const preloadQuery =
+          schema && colCount > 100
+            ? baseQuery.project(schema.columns.slice(0, 100))
+            : baseQuery;
 
         const totalRowCount =
           existing?.totalRowCount ?? (await it.dsc.rowCount(baseQuery));
 
-        let limit: number;
-        let bufferPages = 3;
-        if (colCount <= 50) {
-          bufferPages = 3;
-          limit = Math.min(totalRowCount, newSize * 3);
-        } else if (colCount <= 200) {
-          bufferPages = 1;
-          limit = Math.min(totalRowCount, newSize * 1);
-        } else {
-          bufferPages = 1;
-          limit = Math.min(
-            totalRowCount,
-            Math.max(100, Math.floor(150000 / colCount))
-          );
-        }
+        const maxRowsByCellBudget = Math.max(
+          100,
+          Math.floor(250_000 / Math.max(1, effectiveColCount))
+        );
+        const bufferPages = effectiveColCount <= 50 ? 3 : 1;
+        const limit = Math.min(
+          totalRowCount,
+          newSize * bufferPages,
+          maxRowsByCellBudget
+        );
 
         if (
           existing &&
@@ -1159,7 +1288,7 @@ export class MultipleLoadingManager {
           continue;
         }
 
-        const tableRep = await it.dsc.evalQuery(baseQuery, 0, limit);
+        const tableRep = await it.dsc.evalQuery(preloadQuery, 0, limit);
 
         if (this.currentRewarmSize !== newSize) {
           return;
@@ -1168,6 +1297,7 @@ export class MultipleLoadingManager {
         const updated: FirstPageCacheEntry = {
           tableName,
           schema: tableRep.schema,
+          fullSchema: schema || tableRep.schema,
           tableRep,
           totalRowCount,
           pageSize: newSize,

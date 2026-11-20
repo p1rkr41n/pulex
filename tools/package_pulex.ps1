@@ -15,7 +15,7 @@
 
 param (
     [string]$AppName = "Pulex",
-    [string]$Version = "3.0.3",
+    [string]$Version = "3.0.4",
     [string]$Publisher = "HelloKittyXamKinLung",
     [switch]$SkipFrontendBuild = $false,
     [switch]$SkipBackendBuild = $false

@@ -481,7 +481,7 @@ pub fn dispatch_invoke() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + 
             CommandAction::GetSetupInfo => {
                 invoke.resolver.resolve(json!({
                     "appName": "Pulex",
-                    "version": "3.0.3",
+                    "version": "3.0.4",
                     "engine": "tauri",
                     "platform": "win32"
                 }));

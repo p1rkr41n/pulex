@@ -30,6 +30,7 @@ export interface ViewStateProps {
   delayedCalcMode: boolean; // If true, don't recalc from view params until user hits "apply"
   currentPage: number; // 1-indexed current page
   pageSize: number;
+  queryError: string | null;
 }
 
 let _defaultPageSize = 1000;
@@ -57,6 +58,7 @@ const defaultViewStateProps: ViewStateProps = {
   get pageSize() {
     return _defaultPageSize;
   },
+  queryError: null,
 };
 
 export class ViewState
@@ -77,4 +79,5 @@ export class ViewState
   public readonly delayedCalcMode!: boolean;
   public readonly currentPage!: number;
   public readonly pageSize!: number;
+  public readonly queryError!: string | null;
 }

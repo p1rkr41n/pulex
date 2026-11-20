@@ -37,7 +37,7 @@ pub async fn handle_eval_query(
     tracing::debug!("Compiled DuckDB SQL: {}", sql);
 
     let pool = state.get_duckdb_pool().await;
-    pool.eval_query_arrow(sql).await
+    pool.eval_query_arrow_cancellable(sql, 30_000).await
 }
 
 /// Computes the exact row count for a QueryExp or table
@@ -46,11 +46,125 @@ pub async fn handle_row_count(
     state: &AppState,
     payload: Value,
 ) -> Result<Value, String> {
+    row_count_with_state(state, payload).await
+}
+
+/// Locate a live cached Parquet file in `portable_dir/temp/**` matching `tbl_<8hex>` suffix.
+fn find_live_parquet_for_view(state: &AppState, table_name: &str) -> Option<PathBuf> {
+    let hash_suffix = table_name.strip_prefix("tbl_")?;
+    if hash_suffix.len() != 8 || !hash_suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let expected_ending = format!("_cached_{}.parquet", hash_suffix.to_ascii_lowercase());
+    let temp_dir = state.portable_dir.join("temp");
+    if !temp_dir.exists() {
+        return None;
+    }
+    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir()
+                && !p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .starts_with(".trash")
+            {
+                if let Ok(sub_entries) = std::fs::read_dir(&p) {
+                    for sub in sub_entries.flatten() {
+                        let sp = sub.path();
+                        if sp.is_file() {
+                            let fname = sp
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_ascii_lowercase();
+                            if fname.ends_with(&expected_ending)
+                                && sp.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                            {
+                                return Some(sp);
+                            }
+                        }
+                    }
+                }
+            } else if p.is_file() {
+                let fname = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                if fname.ends_with(&expected_ending)
+                    && p.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Re-bind a stale DuckDB `tbl_<hash>` view to a live Parquet cache file on disk if found.
+async fn try_rebind_stale_table_view(state: &AppState, table_name: &str) -> Option<PathBuf> {
+    let live_pq = find_live_parquet_for_view(state, table_name)?;
+    let safe_pq = live_pq
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "''");
+    let pool = state.get_duckdb_pool().await;
+    let is_evtx = pool
+        .eval_ui_conn({
+            let sp = safe_pq.clone();
+            move |conn| Ok(is_evtx_parquet_schema(conn, &sp))
+        })
+        .await
+        .unwrap_or(false);
+    let source_expr = if is_evtx {
+        build_evtx_parquet_projection(&safe_pq)
+    } else {
+        format!("read_parquet('{}')", safe_pq)
+    };
+    let escaped_v = table_name.replace('"', "\"\"");
+    let ddl = format!(
+        "CREATE OR REPLACE VIEW \"{v}\" AS SELECT * FROM {src};",
+        v = escaped_v,
+        src = source_expr
+    );
+    if pool
+        .eval_ui_conn(move |conn| conn.execute_batch(&ddl).map_err(|e| e.to_string()))
+        .await
+        .is_ok()
+    {
+        state
+            .register_view_parquet_path(table_name.to_string(), live_pq.clone())
+            .await;
+        Some(live_pq)
+    } else {
+        None
+    }
+}
+
+/// Core row count implementation testable without `AppHandle`.
+pub async fn row_count_with_state(state: &AppState, payload: Value) -> Result<Value, String> {
     let (query_rep, _, _) = extract_query_and_pagination(&payload)?;
     ensure_referenced_view_exists(state, &query_rep).await;
 
     let source_hint = match &query_rep {
-        QueryRep::Table { table_name } => Some(table_name.clone()),
+        QueryRep::Table { table_name } => {
+            if let Some(pq_path) = state.get_view_parquet_path(table_name).await {
+                if pq_path.exists() {
+                    Some(pq_path.to_string_lossy().to_string())
+                } else {
+                    state.remove_view_parquet_path(table_name).await;
+                    try_rebind_stale_table_view(state, table_name)
+                        .await
+                        .map(|p| p.to_string_lossy().to_string())
+                        .or_else(|| Some(table_name.clone()))
+                }
+            } else {
+                Some(table_name.clone())
+            }
+        }
         _ => None,
     };
 
@@ -58,8 +172,26 @@ pub async fn handle_row_count(
         .map_err(|e| format!("QueryExp count compilation error: {}", e))?;
 
     let pool = state.get_duckdb_pool().await;
-    let count = pool.eval_row_count(count_sql, source_hint).await?;
-    Ok(json!({ "rowCount": count }))
+    match pool.eval_row_count(count_sql.clone(), source_hint).await {
+        Ok(count) => Ok(json!({ "rowCount": count })),
+        Err(err) => {
+            // Auto-heal stale DuckDB view pointing to a purged project's temp directory
+            if err.contains("No files found that match the pattern") {
+                if let QueryRep::Table { ref table_name } = query_rep {
+                    if let Some(live_pq) = try_rebind_stale_table_view(state, table_name).await {
+                        let healed = pool
+                            .eval_row_count(
+                                count_sql,
+                                Some(live_pq.to_string_lossy().to_string()),
+                            )
+                            .await?;
+                        return Ok(json!({ "rowCount": healed }));
+                    }
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Retrieves the reltab.Schema DTO for a table or query
@@ -187,6 +319,11 @@ pub async fn handle_get_table_name(
     state: &AppState,
     payload: Value,
 ) -> Result<Value, String> {
+    get_table_name_with_state(state, payload).await
+}
+
+/// Core table-name binding implementation testable without `AppHandle`.
+pub async fn get_table_name_with_state(state: &AppState, payload: Value) -> Result<Value, String> {
     let raw_target = payload
         .get("resourceId")
         .or_else(|| payload.get("filePath"))
@@ -233,6 +370,7 @@ pub async fn handle_get_table_name(
         let vname = derived.view_name.clone();
         pool.eval_ui_conn(move |conn| conn.execute_batch(&ddl).map_err(|e| e.to_string()))
             .await?;
+        state.remove_view_parquet_path(&vname).await;
         return Ok(json!(vname));
     }
 
@@ -256,6 +394,12 @@ pub async fn handle_get_table_name(
                 let pool = state.get_duckdb_pool().await;
                 pool.eval_ui_conn(move |conn| conn.execute_batch(&ddl).map_err(|e| e.to_string()))
                     .await?;
+                state
+                    .register_view_parquet_path(view_name.clone(), pq.to_path_buf())
+                    .await;
+                state
+                    .register_view_parquet_path("main_table".to_string(), pq.to_path_buf())
+                    .await;
                 return Ok(json!(view_name));
             }
         }
@@ -322,6 +466,8 @@ pub async fn handle_get_table_name(
             conn.execute_batch(&ddl).map_err(|e| e.to_string())
         })
         .await?;
+        state.remove_view_parquet_path(&view_name).await;
+        state.remove_view_parquet_path("main_table").await;
         return Ok(json!(view_name));
     }
 
@@ -359,6 +505,8 @@ pub async fn handle_get_table_name(
             conn.execute_batch(&ddl).map_err(|e| e.to_string())
         })
         .await?;
+        state.remove_view_parquet_path(&view_name).await;
+        state.remove_view_parquet_path("main_table").await;
         return Ok(json!(view_name));
     }
 
@@ -445,9 +593,16 @@ pub async fn handle_get_table_name(
             compression: cfg.parquet.compression.clone(),
             row_group_size: cfg.parquet.row_group_size,
         };
-        let evtx_threads = pool.resolve_worker_threads(1);
+        let active_workers = sched
+            .get_queue_snapshot()
+            .await
+            .active_jobs
+            .len()
+            .max(1);
+        let evtx_threads = pool.resolve_worker_threads(active_workers);
 
         if format_cat == FileFormatCategory::Evtx || ext == "evtx" {
+            let _permit = pool.acquire_worker_permit().await?;
             let disp_bg = dispatcher.clone();
             let res = tokio::task::spawn_blocking(move || {
                 ingest_evtx_file(&fid, &src_buf, &dst_buf, evtx_threads, &ct, Some(&disp_bg))
@@ -462,7 +617,7 @@ pub async fn handle_get_table_name(
             let disp_bg = dispatcher.clone();
             let comp = csv_opts.compression.clone();
             let rg = csv_opts.row_group_size;
-            pool.run_ingest_task(move |conn| {
+            pool.run_ingest_task_with_budget(active_workers, move |conn| {
                 ingest_jsonl_file_with_options(
                     &fid,
                     &src_buf,
@@ -484,7 +639,7 @@ pub async fn handle_get_table_name(
             let disp_bg = dispatcher.clone();
             let comp = csv_opts.compression.clone();
             let rg = csv_opts.row_group_size;
-            pool.run_ingest_task(move |conn| {
+            pool.run_ingest_task_with_budget(active_workers, move |conn| {
                 ingest_dirty_log_duckdb(
                     &fid,
                     &src_buf,
@@ -503,7 +658,7 @@ pub async fn handle_get_table_name(
             // CSV / TSV / TXT / GzipText / Utf16Text -> Parallel-first 3-tier fallback + native .gz
             let disp_bg = dispatcher.clone();
             let opts = csv_opts.clone();
-            pool.run_ingest_task(move |conn| {
+            pool.run_ingest_task_with_budget(active_workers, move |conn| {
                 ingest_csv_file_with_options(
                     &fid,
                     &src_buf,
@@ -543,6 +698,25 @@ pub async fn handle_get_table_name(
             .map_err(|e| format!("Failed to create DuckDB view for file: {}", e))
     })
     .await?;
+
+    let backing_pq = cached_parquet_path.clone().or_else(|| {
+        if format_cat == FileFormatCategory::Parquet || ext == "parquet" {
+            Some(path_obj.to_path_buf())
+        } else {
+            None
+        }
+    });
+    if let Some(pq) = backing_pq {
+        state
+            .register_view_parquet_path(view_name.clone(), pq.clone())
+            .await;
+        state
+            .register_view_parquet_path("main_table".to_string(), pq)
+            .await;
+    } else {
+        state.remove_view_parquet_path(&view_name).await;
+        state.remove_view_parquet_path("main_table").await;
+    }
 
     Ok(json!(view_name))
 }
@@ -806,84 +980,350 @@ pub async fn handle_get_children(
     }
 }
 
-/// Computes and caches column statistics using DuckDB `SUMMARIZE` when `StatsCache` misses
+const MAX_SUMMARIZE_COLUMNS: usize = 100;
+
+#[derive(Clone)]
+enum WorkerViewSource {
+    Parquet {
+        view_name: String,
+        parquet_path: PathBuf,
+    },
+    DerivedDdl {
+        sql_ddl: String,
+    },
+}
+
+fn collect_referenced_tables(rep: &QueryRep, out: &mut Vec<String>) {
+    match rep {
+        QueryRep::Table { table_name } => {
+            if !out.contains(table_name) {
+                out.push(table_name.clone());
+            }
+        }
+        QueryRep::Sql { .. } => {}
+        QueryRep::Project { from, .. }
+        | QueryRep::Filter { from, .. }
+        | QueryRep::GroupBy { from, .. }
+        | QueryRep::Sort { from, .. }
+        | QueryRep::Extend { from, .. }
+        | QueryRep::MapColumns { from, .. }
+        | QueryRep::MapColumnsByIndex { from, .. } => {
+            collect_referenced_tables(from, out);
+        }
+        QueryRep::Join { lhs, rhs, .. } => {
+            collect_referenced_tables(lhs, out);
+            collect_referenced_tables(rhs, out);
+        }
+        QueryRep::Concat { from, target } => {
+            collect_referenced_tables(from, out);
+            collect_referenced_tables(target, out);
+        }
+    }
+}
+
+fn resolve_worker_view_source_rec<'a>(
+    state: &'a AppState,
+    name: &'a str,
+    visited: &'a mut std::collections::HashSet<String>,
+    visiting: &'a mut std::collections::HashSet<String>,
+    ordered: &'a mut Vec<WorkerViewSource>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+    Box::pin(async move {
+        if visited.contains(name) {
+            return true;
+        }
+        if !visiting.insert(name.to_string()) {
+            return false;
+        }
+
+        let ok = if let Some(derived) = state.get_derived_view(name).await {
+            let base_ok = resolve_worker_view_source_rec(
+                state,
+                &derived.base_table,
+                visited,
+                visiting,
+                ordered,
+            )
+            .await;
+            if base_ok {
+                ordered.push(WorkerViewSource::DerivedDdl {
+                    sql_ddl: derived.sql_ddl,
+                });
+                true
+            } else {
+                false
+            }
+        } else if let Some(pq_path) = state.get_view_parquet_path(name).await {
+            if pq_path.exists() {
+                ordered.push(WorkerViewSource::Parquet {
+                    view_name: name.to_string(),
+                    parquet_path: pq_path,
+                });
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        visiting.remove(name);
+        if ok {
+            visited.insert(name.to_string());
+        }
+        ok
+    })
+}
+
+async fn resolve_worker_view_sources(
+    state: &AppState,
+    tables: &[String],
+) -> Option<Vec<WorkerViewSource>> {
+    if tables.is_empty() {
+        return None;
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    let mut visiting = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+
+    for tbl in tables {
+        if !resolve_worker_view_source_rec(state, tbl, &mut visited, &mut visiting, &mut ordered)
+            .await
+        {
+            return None;
+        }
+    }
+
+    Some(ordered)
+}
+
+fn is_evtx_parquet_schema(conn: &duckdb::Connection, safe_pq: &str) -> bool {
+    let sql = format!("DESCRIBE SELECT * FROM read_parquet('{}') LIMIT 0;", safe_pq);
+    let mut cols = std::collections::HashSet::new();
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(name) = row.get::<_, String>(0) {
+                    cols.insert(name);
+                }
+            }
+        }
+    }
+    cols.contains("record_id")
+        && cols.contains("level_name")
+        && cols.contains("event_data")
+        && cols.contains("binary")
+}
+
+fn execute_summarize_on_conn(
+    conn: &duckdb::Connection,
+    sum_sql: &str,
+) -> Result<(ColumnStatsMap, Option<i64>), String> {
+    let mut stmt = conn.prepare(sum_sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    let mut stats_map = ColumnStatsMap::new();
+    let mut row_count_opt: Option<i64> = None;
+
+    while let Ok(Some(row)) = rows.next() {
+        let col_name: String = row.get(0).unwrap_or_default();
+        let col_type: String =
+            row.get::<usize, String>(1).unwrap_or_default().to_uppercase();
+        let min_s: Option<String> = row.get(2).ok();
+        let max_s: Option<String> = row.get(3).ok();
+        let approx_unique: Option<i64> = row.get(4).ok();
+        let count: i64 = row.get(9).unwrap_or(0);
+        let null_pct_raw: Option<f64> = row
+            .get::<_, f64>(10)
+            .ok()
+            .or_else(|| {
+                row.get::<_, String>(10)
+                    .ok()
+                    .and_then(|s| s.trim_end_matches('%').parse::<f64>().ok())
+            });
+
+        if row_count_opt.is_none() {
+            row_count_opt = Some(count);
+        }
+        let pct_null = null_pct_raw.map(|p| p / 100.0);
+        let min_num = min_s.as_deref().and_then(|s| s.parse::<f64>().ok());
+        let max_num = max_s.as_deref().and_then(|s| s.parse::<f64>().ok());
+
+        let is_num = col_type.contains("INT")
+            || col_type.contains("DOUBLE")
+            || col_type.contains("FLOAT")
+            || col_type.contains("DECIMAL")
+            || col_type.contains("REAL");
+
+        let dto = if is_num {
+            ColumnStatsDto::Numeric {
+                min: min_num,
+                max: max_num,
+                approx_unique,
+                count,
+                pct_null,
+            }
+        } else {
+            ColumnStatsDto::Text {
+                min: min_num,
+                max: max_num,
+                approx_unique,
+                count,
+                pct_null,
+            }
+        };
+        stats_map.insert(col_name, dto);
+    }
+    Ok((stats_map, row_count_opt))
+}
+
+/// Computes and caches column statistics using DuckDB `SUMMARIZE` when `StatsCache` misses.
+/// Isolates `SUMMARIZE` onto a worker connection for parquet-backed views and caps wide tables
+/// to at most `MAX_SUMMARIZE_COLUMNS` (100) columns unless explicit `columns` are requested.
 pub async fn handle_get_column_stats_map(
     _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    get_column_stats_map_with_state(state, payload).await
+}
+
+/// Core column stats implementation testable without `AppHandle`.
+pub async fn get_column_stats_map_with_state(
     state: &AppState,
     payload: Value,
 ) -> Result<Value, String> {
     let pool = state.get_duckdb_pool().await;
     if let Ok((query_rep, _, _)) = extract_query_and_pagination(&payload) {
         ensure_referenced_view_exists(state, &query_rep).await;
-        let cache_key = match &query_rep {
+
+        let requested_columns: Option<Vec<String>> = payload
+            .get("columns")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<String>>()
+            })
+            .filter(|cols| !cols.is_empty());
+
+        let base_cache_key = match &query_rep {
             QueryRep::Table { table_name } => table_name.clone(),
             other => QueryExpCompiler::compile(other, None, None).unwrap_or_default(),
         };
-        if !cache_key.is_empty() {
+
+        if !base_cache_key.is_empty() {
+            let cache_key = if let Some(ref cols) = requested_columns {
+                let cols_json = serde_json::to_string(cols).unwrap_or_default();
+                format!("{}::cols:{}", base_cache_key, cols_json)
+            } else {
+                base_cache_key
+            };
+
             if let Some(stats) = pool.stats_cache().get(&cache_key).await {
                 return serde_json::to_value(&stats).map_err(|e| e.to_string());
             }
 
             if let Ok(base_sql) = QueryExpCompiler::compile(&query_rep, None, None) {
-                let sum_sql = format!("SUMMARIZE SELECT * FROM ({}) AS _sum_src;", base_sql);
-                if let Ok(computed) = pool
-                    .eval_ui_conn(move |conn| {
-                        let mut stmt = conn.prepare(&sum_sql).map_err(|e| e.to_string())?;
-                        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-                        let mut stats_map = ColumnStatsMap::new();
-                        let mut row_count_opt: Option<i64> = None;
+                let schema_target = match &query_rep {
+                    QueryRep::Table { table_name } => table_name.clone(),
+                    _ => base_sql.clone(),
+                };
+                let schema_dto = pool.eval_schema(schema_target).await.unwrap_or_else(|_| {
+                    crate::engine::schema_mapper::SchemaDto {
+                        dialect: "duckdb".to_string(),
+                        columns: Vec::new(),
+                        column_metadata: std::collections::HashMap::new(),
+                        column_types: std::collections::HashMap::new(),
+                    }
+                });
 
-                        while let Ok(Some(row)) = rows.next() {
-                            let col_name: String = row.get(0).unwrap_or_default();
-                            let col_type: String =
-                                row.get::<usize, String>(1).unwrap_or_default().to_uppercase();
-                            let min_s: Option<String> = row.get(2).ok();
-                            let max_s: Option<String> = row.get(3).ok();
-                            let approx_unique: Option<i64> = row.get(4).ok();
-                            let count: i64 = row.get(9).unwrap_or(0);
-                            let null_pct_raw: Option<f64> = row
-                                .get::<_, f64>(10)
-                                .ok()
-                                .or_else(|| row.get::<_, String>(10).ok().and_then(|s| s.trim_end_matches('%').parse::<f64>().ok()));
+                let target_cols: Vec<String> = if let Some(ref explicit) = requested_columns {
+                    if schema_dto.columns.is_empty() {
+                        explicit.clone()
+                    } else {
+                        let valid: std::collections::HashSet<&str> =
+                            schema_dto.columns.iter().map(|s| s.as_str()).collect();
+                        explicit
+                            .iter()
+                            .filter(|c| valid.contains(c.as_str()))
+                            .cloned()
+                            .collect()
+                    }
+                } else if schema_dto.columns.len() > MAX_SUMMARIZE_COLUMNS {
+                    schema_dto.columns[..MAX_SUMMARIZE_COLUMNS].to_vec()
+                } else {
+                    schema_dto.columns.clone()
+                };
 
-                            if row_count_opt.is_none() {
-                                row_count_opt = Some(count);
+                if requested_columns.is_some()
+                    && !schema_dto.columns.is_empty()
+                    && target_cols.is_empty()
+                {
+                    return Ok(json!({}));
+                }
+
+                let select_cols = if target_cols.is_empty() {
+                    "*".to_string()
+                } else {
+                    target_cols
+                        .iter()
+                        .map(|c| QueryExpCompiler::quote_ident(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+
+                let sum_sql =
+                    format!("SUMMARIZE SELECT {} FROM ({}) AS _sum_src;", select_cols, base_sql);
+
+                let mut referenced_tables = Vec::new();
+                collect_referenced_tables(&query_rep, &mut referenced_tables);
+                let worker_sources = resolve_worker_view_sources(state, &referenced_tables).await;
+
+                let computed_res = if let Some(sources) = worker_sources {
+                    let sum_sql_worker = sum_sql.clone();
+                    pool.run_read_worker_task(move |conn| {
+                        for src in sources {
+                            match src {
+                                WorkerViewSource::Parquet {
+                                    view_name,
+                                    parquet_path,
+                                } => {
+                                    let safe_pq = parquet_path
+                                        .to_string_lossy()
+                                        .replace('\\', "/")
+                                        .replace('\'', "''");
+                                    let src_expr = if is_evtx_parquet_schema(conn, &safe_pq) {
+                                        build_evtx_parquet_projection(&safe_pq)
+                                    } else {
+                                        format!("read_parquet('{}')", safe_pq)
+                                    };
+                                    let ddl = format!(
+                                        "CREATE OR REPLACE VIEW {} AS SELECT * FROM {};",
+                                        QueryExpCompiler::quote_ident(&view_name),
+                                        src_expr
+                                    );
+                                    conn.execute_batch(&ddl).map_err(|e| e.to_string())?;
+                                }
+                                WorkerViewSource::DerivedDdl { sql_ddl } => {
+                                    conn.execute_batch(&sql_ddl).map_err(|e| e.to_string())?;
+                                }
                             }
-                            let pct_null = null_pct_raw.map(|p| p / 100.0);
-                            let min_num = min_s.as_deref().and_then(|s| s.parse::<f64>().ok());
-                            let max_num = max_s.as_deref().and_then(|s| s.parse::<f64>().ok());
-
-                            let is_num = col_type.contains("INT")
-                                || col_type.contains("DOUBLE")
-                                || col_type.contains("FLOAT")
-                                || col_type.contains("DECIMAL")
-                                || col_type.contains("REAL");
-
-                            let dto = if is_num {
-                                ColumnStatsDto::Numeric {
-                                    min: min_num,
-                                    max: max_num,
-                                    approx_unique,
-                                    count,
-                                    pct_null,
-                                }
-                            } else {
-                                ColumnStatsDto::Text {
-                                    min: min_num,
-                                    max: max_num,
-                                    approx_unique,
-                                    count,
-                                    pct_null,
-                                }
-                            };
-                            stats_map.insert(col_name, dto);
                         }
-                        Ok((stats_map, row_count_opt))
+                        execute_summarize_on_conn(conn, &sum_sql_worker)
                     })
                     .await
-                {
-                    let (stats_map, rc) = computed;
-                    pool.stats_cache().insert(cache_key, stats_map.clone(), rc).await;
+                } else {
+                    // Fallback to ui_conn only for attached .duckdb / .sqlite or raw SQL without parquet backing
+                    pool.eval_ui_conn(move |conn| execute_summarize_on_conn(conn, &sum_sql))
+                        .await
+                };
+
+                if let Ok((stats_map, rc)) = computed_res {
+                    pool.stats_cache()
+                        .insert(cache_key, stats_map.clone(), rc)
+                        .await;
                     return serde_json::to_value(&stats_map).map_err(|e| e.to_string());
                 }
             }
@@ -1090,5 +1530,236 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["host"], json!("evil.example"));
         assert_eq!(rows[0]["path"], json!("a.exe"));
+    }
+
+    #[tokio::test]
+    async fn test_fast_counter_via_view_parquet_paths_matches_duckdb_count() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("pulex_m2_fastcount_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+
+        let pq_path = tmp_dir.join("sample_events.parquet");
+        let pq_str = pq_path.to_string_lossy().replace('\\', "/").replace('\'', "''");
+        {
+            let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+            conn.execute_batch(&format!(
+                "COPY (SELECT range AS id, 'evt_' || range::VARCHAR AS msg FROM range(125)) TO '{}' (FORMAT PARQUET);",
+                pq_str
+            ))
+            .expect("write sample parquet");
+        }
+
+        let state = AppState::new(tmp_dir.clone(), crate::portable::ToadConfig::default());
+        let tbl_val = get_table_name_with_state(
+            &state,
+            json!({ "filePath": pq_path.to_string_lossy().to_string() }),
+        )
+        .await
+        .expect("get_table_name_with_state should succeed");
+        let view_name = tbl_val
+            .as_str()
+            .expect("view name string")
+            .to_string();
+
+        assert_eq!(
+            state.get_view_parquet_path(&view_name).await,
+            Some(pq_path.clone())
+        );
+        assert_eq!(
+            state.get_view_parquet_path("main_table").await,
+            Some(pq_path.clone())
+        );
+
+        let count_val = row_count_with_state(
+            &state,
+            json!({
+                "query": {
+                    "operator": "table",
+                    "tableName": view_name
+                }
+            }),
+        )
+        .await
+        .expect("row_count_with_state should succeed");
+        assert_eq!(count_val["rowCount"], json!(125));
+
+        // Prove FastCounter path is used via view_parquet_paths even without a DuckDB view
+        state
+            .register_view_parquet_path("tbl_fast_only".to_string(), pq_path.clone())
+            .await;
+        let fast_only_val = row_count_with_state(
+            &state,
+            json!({
+                "query": {
+                    "operator": "table",
+                    "tableName": "tbl_fast_only"
+                }
+            }),
+        )
+        .await
+        .expect("FastCounter resolution via view_parquet_paths should succeed without view");
+        assert_eq!(fast_only_val["rowCount"], json!(125));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_summarize_caps_wide_table_at_100_columns_and_supports_explicit_columns() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("pulex_m2_summarize_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+
+        let pq_path = tmp_dir.join("wide_120_cols.parquet");
+        let pq_str = pq_path.to_string_lossy().replace('\\', "/").replace('\'', "''");
+        let col_exprs: Vec<String> = (0..120)
+            .map(|i| format!("(range + {})::BIGINT AS \"c{}\"", i, i))
+            .collect();
+        {
+            let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+            conn.execute_batch(&format!(
+                "COPY (SELECT {} FROM range(10)) TO '{}' (FORMAT PARQUET);",
+                col_exprs.join(", "),
+                pq_str
+            ))
+            .expect("write 120-column parquet");
+        }
+
+        let state = AppState::new(tmp_dir.clone(), crate::portable::ToadConfig::default());
+        let tbl_val = get_table_name_with_state(
+            &state,
+            json!({ "filePath": pq_path.to_string_lossy().to_string() }),
+        )
+        .await
+        .expect("get_table_name_with_state should succeed");
+        let view_name = tbl_val.as_str().expect("view name string").to_string();
+
+        // 1. Default SUMMARIZE without explicit columns caps at 100 columns
+        let default_stats = get_column_stats_map_with_state(
+            &state,
+            json!({
+                "query": {
+                    "operator": "table",
+                    "tableName": view_name
+                }
+            }),
+        )
+        .await
+        .expect("default SUMMARIZE should succeed");
+        let default_obj = default_stats.as_object().expect("stats JSON object");
+        assert_eq!(
+            default_obj.len(),
+            100,
+            "Default SUMMARIZE on 120-col table must cap at 100 columns"
+        );
+        assert!(default_obj.contains_key("c0"));
+        assert!(default_obj.contains_key("c99"));
+        assert!(!default_obj.contains_key("c100"));
+
+        // 2. Explicit columns request bypasses the first-100 slice and avoids cache collision
+        let explicit_stats = get_column_stats_map_with_state(
+            &state,
+            json!({
+                "query": {
+                    "operator": "table",
+                    "tableName": view_name
+                },
+                "columns": ["c105", "c119"]
+            }),
+        )
+        .await
+        .expect("explicit-columns SUMMARIZE should succeed");
+        let explicit_obj = explicit_stats
+            .as_object()
+            .expect("explicit stats JSON object");
+        assert_eq!(explicit_obj.len(), 2);
+        assert!(explicit_obj.contains_key("c105"));
+        assert!(explicit_obj.contains_key("c119"));
+
+        // 3. Re-querying default still returns the cached 100-column entry
+        let cached_default = get_column_stats_map_with_state(
+            &state,
+            json!({
+                "query": {
+                    "operator": "table",
+                    "tableName": view_name
+                }
+            }),
+        )
+        .await
+        .expect("cached default SUMMARIZE should succeed");
+        assert_eq!(cached_default.as_object().unwrap().len(), 100);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_row_count_auto_heals_stale_view_after_project_cache_move() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "pulex_stale_view_heal_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let state = AppState::new(tmp_dir.clone(), crate::portable::ToadConfig::default());
+        let old_dir = tmp_dir.join("temp").join("rp2i6");
+        let new_dir = tmp_dir.join("temp").join("rptme");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let old_pq = old_dir.join("test_all_cached_17f24271.parquet");
+        let new_pq = new_dir.join("test_all_cached_17f24271.parquet");
+
+        // Write a valid 7-row Parquet file in the NEW project directory
+        let new_pq_str = new_pq.to_string_lossy().replace('\\', "/").replace('\'', "''");
+        let pool = state.get_duckdb_pool().await;
+        pool.eval_ui_conn({
+            let dst = new_pq_str.clone();
+            move |conn| {
+                conn.execute_batch(&format!(
+                    "COPY (SELECT range AS id FROM range(7)) TO '{}' (FORMAT PARQUET);",
+                    dst
+                ))
+                .map_err(|e| e.to_string())
+            }
+        })
+        .await
+        .expect("write live parquet");
+
+        // Seed old_pq so DuckDB allows creating the view, then remove old_dir to simulate project deletion
+        std::fs::copy(&new_pq, &old_pq).expect("seed old parquet");
+        let old_pq_str = old_pq.to_string_lossy().replace('\\', "/").replace('\'', "''");
+        pool.eval_ui_conn(move |conn| {
+            conn.execute_batch(&format!(
+                "CREATE OR REPLACE VIEW \"tbl_17f24271\" AS SELECT * FROM read_parquet('{}');",
+                old_pq_str
+            ))
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .expect("create stale view");
+        state
+            .register_view_parquet_path("tbl_17f24271".to_string(), old_pq.clone())
+            .await;
+        std::fs::remove_dir_all(&old_dir).expect("delete old project cache dir");
+
+        // row_count_with_state must detect the missing old file, auto-rebind to temp/rptme/, and return 7
+        let res = row_count_with_state(
+            &state,
+            json!({
+                "query": {
+                    "operator": "table",
+                    "tableName": "tbl_17f24271"
+                }
+            }),
+        )
+        .await
+        .expect("row_count_with_state must self-heal stale view");
+        assert_eq!(res["rowCount"], json!(7));
+        assert_eq!(
+            state.get_view_parquet_path("tbl_17f24271").await,
+            Some(new_pq)
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

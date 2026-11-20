@@ -13,6 +13,7 @@ pub mod ingest;
 pub mod ledger;
 pub mod logger;
 pub mod portable;
+pub mod runtime_dlls;
 pub mod state;
 
 #[cfg_attr(test, allow(unused_imports))]
@@ -175,7 +176,9 @@ fn setup_native_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
             "menu_about" => {
                 let about_text = concat!(
                     "Pulex Data Analyzer\n",
-                    "Version 3.0.0\n\n",
+                    "Version ",
+                    env!("CARGO_PKG_VERSION"),
+                    "\n\n",
                     "Engine: Tauri v2 + Rust + DuckDB 1.2.2 + Apache Arrow IPC\n\n",
                     "Copyright (c) 2026 HelloKittyXamKinLung"
                 );
@@ -198,6 +201,10 @@ fn setup_native_menu(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>>
 #[cfg(not(test))]
 pub fn build_app() -> Result<tauri::Builder<tauri::Wry>, Box<dyn std::error::Error>> {
     let (paths, mut config) = portable::ensure_portable_environment(None)?;
+    // Extract embedded duckdb.dll & WebView2Loader.dll into pulexAppData_<id>/bin/ and register
+    // DLL search path BEFORE touching DuckDB (AppState::new) or WebView2 (tauri::Builder).
+    runtime_dlls::ensure_runtime_dlls_loaded(&paths.app_data_dir)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     // Pin WebView2 user data inside the canonical portable pulexAppData_<5chars> folder
     if std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
         let wv2_dir = paths.app_data_dir.join("WebView2");
@@ -261,7 +268,10 @@ pub fn build_app() -> Result<tauri::Builder<tauri::Wry>, Box<dyn std::error::Err
 /// Main application entry point invoked from main.rs
 #[cfg(not(test))]
 pub fn run() {
-    tracing::info!("Starting Pulex Desktop v3.0.0 Core Runtime...");
+    tracing::info!(
+        "Starting Pulex Desktop v{} Core Runtime...",
+        env!("CARGO_PKG_VERSION")
+    );
 
     match build_app() {
         Ok(builder) => {

@@ -45,12 +45,12 @@ pub async fn handle_init_main<R: Runtime>(
     state: &AppState,
 ) -> Result<Value, String> {
     let cfg = state.get_config().await;
-    tracing::info!("toad:init_main invoked - Pulex Core v3.0.1 ready");
+    tracing::info!("toad:init_main invoked - Pulex Core v3.0.2 ready");
 
     Ok(json!({
         "status": "ready",
         "product": "Pulex",
-        "version": "3.0.1",
+        "version": "3.0.2",
         "portableDir": state.portable_dir.to_string_lossy(),
         "config": cfg,
     }))
@@ -470,7 +470,7 @@ pub async fn handle_save_workspace<R: Runtime>(
         let enriched = json!({
             "tadFileFormatVersion": 2,
             "application": "Pulex",
-            "version": "3.0.1",
+            "version": "3.0.2",
             "savedAtMs": crate::ledger::parquet_ledger::current_time_ms(),
             "contents": contents,
             "activeProjectId": active_pid,

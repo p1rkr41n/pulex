@@ -36,7 +36,7 @@ export interface TextFormatOptionsProps {
 
 const defaultTextFormatOptionsProps: TextFormatOptionsProps = {
   type: "TextFormatOptions",
-  urlsAsHyperlinks: true,
+  urlsAsHyperlinks: false,
 };
 
 const isValidURL = (s: string): boolean => {
@@ -73,10 +73,7 @@ export class TextFormatOptions
 
   getFormatter(): CellFormatter {
     const ff = (val?: any): string | undefined | null => {
-      if (this.urlsAsHyperlinks && typeof val === "string" && val && isValidURL(val)) {
-        const safeUrl = he.encode(val);
-        return `<a class="pulex-cell-link" rel="noopener noreferrer" href="${safeUrl}">${safeUrl}</a>`;
-      }
+      // Strict DFIR / SecOps plain-text URL policy: never render clickable <a> hyperlinks
       const valStr = stringify(val);
       const fmtStr = valStr ? he.encode(valStr) : valStr;
       return fmtStr;
@@ -90,16 +87,13 @@ export class TextFormatOptions
   }
 
   getClickHandler(): ClickHandler {
+    // Strict DFIR / SecOps plain-text URL policy: never open external browser on cell click
     const ch = (
-      appContext: ClickHandlerAppContext,
+      _appContext: ClickHandlerAppContext,
       _row: number,
       _column: number,
-      val: any
-    ) => {
-      if (this.urlsAsHyperlinks && typeof val === "string" && val && isValidURL(val)) {
-        appContext.openURL(val);
-      }
-    };
+      _val: any
+    ) => {};
     return ch;
   }
 }

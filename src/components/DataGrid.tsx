@@ -1375,9 +1375,8 @@ const createGrid = (
     }
   });
 
-  // State persistence across virtual scrolling & viewport rebuilds
+  // Frozen header scroll elevation + state persistence across virtual scrolling & viewport rebuilds
   grid.onScroll.subscribe((e: any, scrollArgs: any) => {
-    if (!activeRowState) return;
     const vp = getViewportElement();
     const curTop =
       scrollArgs && typeof scrollArgs.scrollTop === "number"
@@ -1392,6 +1391,20 @@ const createGrid = (
         ? vp.scrollLeft || 0
         : 0;
 
+    const containerEl =
+      document.getElementById(containerId) ||
+      (typeof (grid as any).getContainerNode === "function"
+        ? (grid as any).getContainerNode()
+        : null);
+    if (containerEl) {
+      containerEl.classList.toggle("is-scrolled", curTop > 0);
+      const headerScroller = containerEl.querySelector(".slick-header") as HTMLElement | null;
+      if (headerScroller && headerScroller.scrollLeft !== curLeft) {
+        headerScroller.scrollLeft = curLeft;
+      }
+    }
+
+    if (!activeRowState) return;
     activeRowState.scrollTopSnap = curTop;
     activeRowState.scrollLeftSnap = curLeft;
     reapplyActiveRowState();

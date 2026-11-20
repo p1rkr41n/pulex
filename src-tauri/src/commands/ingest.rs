@@ -55,13 +55,14 @@ pub async fn handle_ingest_file(
     payload: Value,
 ) -> Result<IngestFileResponse, ErrorResponse> {
     let file_path = get_str_param(&payload, "filePath", "file_path")
+        .or_else(|| payload.get("path").and_then(|v| v.as_str()))
         .ok_or_else(|| ErrorResponse::invalid_argument("Missing filePath parameter"))?;
 
     let ledger = state.parquet_ledger.read().await;
-    let project_id = get_str_param(&payload, "projectId", "project_id")
-        .map(|s| s.to_string())
-        .or_else(|| ledger.active_project_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let project_id = match get_str_param(&payload, "projectId", "project_id") {
+        Some(s) => s.to_string(),
+        None => ledger.get_active_project_id().await,
+    };
     drop(ledger);
 
     let is_vip = payload

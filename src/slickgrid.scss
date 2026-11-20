@@ -2,6 +2,38 @@
 @import "~slickgrid-es6/dist/slick.grid.scss";
 @import "~slickgrid-es6/dist/slick-default-theme.scss";
 
+/* --- Frozen Column Header Layout (Always Pinned on Vertical Scroll) --- */
+.slickgrid-container {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+
+  .slick-header {
+    flex: 0 0 auto;
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background: var(--toad-grid-header, #f1f5f9);
+    transition: box-shadow 0.15s ease;
+  }
+
+  &.is-scrolled .slick-header {
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.14);
+  }
+
+  .slick-headerrow {
+    flex: 0 0 auto;
+    position: sticky;
+    z-index: 29;
+  }
+
+  .slick-viewport {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+  }
+}
+
 /* --- Pulex Hover-to-Sort Header Styles --- */
 .slick-header-column {
   position: relative;
@@ -236,6 +268,10 @@ body.bp4-overlay-open {
   .slick-header-columns {
     background: var(--md-sys-color-surface-container, #25262c) !important;
     border-bottom: 1px solid var(--md-sys-color-outline-variant, #3c3e47) !important;
+  }
+
+  .slickgrid-container.is-scrolled .slick-header {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
   }
 
   .slick-header-column.ui-state-default {

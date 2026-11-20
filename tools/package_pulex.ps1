@@ -15,7 +15,7 @@
 
 param (
     [string]$AppName = "Pulex",
-    [string]$Version = "3.0.1",
+    [string]$Version = "3.0.2",
     [string]$Publisher = "HelloKittyXamKinLung",
     [switch]$SkipFrontendBuild = $false,
     [switch]$SkipBackendBuild = $false
@@ -92,18 +92,13 @@ if (-not (Test-Path "$targetReleaseDir\WebView2Loader.dll")) {
 Get-ChildItem -Path $targetReleaseDir -Filter "*toad*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
 Write-Output "           Backend binary ($builtExe) and companion DLLs verified."
 
-# 3. Footprint Gate Assertion
+# 3. Footprint Gate Assertion (Single-File Self-Contained Executable)
 Write-Output "[STEP 3/6] Verifying Footprint Gate..."
 $exeItem = Get-Item $builtExe
-$duckdbItem = Get-Item "$targetReleaseDir\duckdb.dll"
-$webviewItem = Get-Item "$targetReleaseDir\WebView2Loader.dll"
-$totalMB = [math]::Round(($exeItem.Length + $duckdbItem.Length + $webviewItem.Length) / 1MB, 2)
-Write-Output "           Pulex Binary: $([math]::Round($exeItem.Length / 1MB, 2)) MB"
-Write-Output "           DuckDB 1.2.2: $([math]::Round($duckdbItem.Length / 1MB, 2)) MB"
-Write-Output "           WebView2:     $([math]::Round($webviewItem.Length / 1MB, 2)) MB"
-Write-Output "           Total uncompressed footprint: $totalMB MB"
-if ($totalMB -ge 85.0) {
-    throw "FOOTPRINT GATE ERROR: Uncompressed package footprint ($totalMB MB) exceeds 85.0 MB ceiling!"
+$exeSizeGateMB = [math]::Round($exeItem.Length / 1MB, 2)
+Write-Output "           Pulex Single-File Portable Binary (with embedded gzip DuckDB 1.2.2 + WebView2Loader): $exeSizeGateMB MB"
+if ($exeSizeGateMB -ge 55.0) {
+    throw "FOOTPRINT GATE ERROR: Single-file executable ($exeSizeGateMB MB) exceeds 55.0 MB ceiling!"
 }
 
 # 4. Enforce Zero-Duplicate Clean Releases Directory
@@ -136,10 +131,8 @@ $sDir = Join-Path $env:TEMP "Pulex_package_stage_$Version"
 if (Test-Path $sDir) { Remove-Item -Recurse -Force $sDir }
 New-Item -ItemType Directory -Path $sDir | Out-Null
 
-# Strict Zero-Duplicate ZIP layout: ONLY Pulex-<version>-x64-portable.exe + companion DLLs
+# Strict Single-File Portable ZIP layout: ONLY Pulex-<version>-x64-portable.exe (zero external DLLs needed)
 Copy-Item $builtExe "$sDir\$pExeName"
-Copy-Item "$targetReleaseDir\duckdb.dll" "$sDir\duckdb.dll"
-Copy-Item "$targetReleaseDir\WebView2Loader.dll" "$sDir\WebView2Loader.dll"
 
 $zPulex = Join-Path $releasesDir $pZipName
 if (Test-Path $zPulex) { Remove-Item $zPulex -Force }

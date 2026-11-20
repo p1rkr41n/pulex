@@ -1,11 +1,11 @@
-# Pulex v3.0.1 — Portable Release Distribution
+# Pulex v3.0.2 — Single-File Portable Release Distribution
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../LICENSE)
 [![Engine](https://img.shields.io/badge/Engine-DuckDB%201.2.2%20%7C%20Rust%20%7C%20Tauri%20v2-green.svg)](https://duckdb.org/)
-[![Version](https://img.shields.io/badge/Version-3.0.1-brightgreen.svg)](./)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20x64%20(Portable)-orange.svg)](./)
+[![Version](https://img.shields.io/badge/Version-3.0.2-brightgreen.svg)](./)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x64%20(Single--File%20Portable)-orange.svg)](./)
 
-**Pulex** is packaged as a zero-install, self-contained Windows x64 portable desktop analyzer powered by **Tauri v2**, **DuckDB 1.2.2**, and **Apache Arrow IPC**.
+**Pulex** is packaged as a true **single-file, zero-install** Windows x64 portable desktop analyzer powered by **Tauri v2**, **DuckDB 1.2.2**, and **Apache Arrow IPC**. Copy the standalone `.exe` to any folder and run it immediately with zero external DLL dependencies.
 
 ---
 
@@ -13,23 +13,23 @@
 
 | Artifact | Contents | Purpose |
 | :--- | :--- | :--- |
-| `Pulex-3.0.1-x64-portable.zip` | `Pulex-3.0.1-x64-portable.exe`, `duckdb.dll`, `WebView2Loader.dll` | **Recommended**: Complete standalone portable archive ready to extract and run anywhere |
-| `Pulex-3.0.1-x64-portable.exe` | Native Tauri v2 executable (Control Flow Guard enabled, multi-size embedded icons & PerMonitorV2 DPI manifest) | Standalone binary for updating an existing Pulex directory containing companion DLLs |
+| `Pulex-3.0.2-x64-portable.exe` | Self-contained Tauri v2 executable (delay-loaded embedded `duckdb.dll` + `WebView2Loader.dll`, Control Flow Guard enabled, multi-size transparent Pulex icons & PerMonitorV2 DPI manifest) | **Direct Standalone Binary**: Copy anywhere and double-click to run immediately |
+| `Pulex-3.0.2-x64-portable.zip` | `Pulex-3.0.2-x64-portable.exe` | **Browser-Friendly Archive**: Frictionless download for Edge/Chrome & WinGet distribution |
 | `HelloKittyXamKinLung.Pulex.yaml` | WinGet v1.6.0 singleton manifest (`zip` + `portable`) | Automated installation via Windows Package Manager |
 | `SHA256SUMS.txt` | Lowercase SHA-256 digests | Cryptographic integrity verification |
-| `v3.0.1_NOTES.md` | Release notes | Summary of features, fixes, and security hardenings in v3.0.1 |
+| `v3.0.2_NOTES.md` | Release notes | Summary of single-file portable packaging and transparent branding in v3.0.2 |
 
 ---
 
 ## 2. Quick Start
 
-1. **Extract & Launch**: Extract `Pulex-3.0.1-x64-portable.zip` to any folder (ensuring `Pulex-3.0.1-x64-portable.exe`, `duckdb.dll`, and `WebView2Loader.dll` remain in the same directory) and launch `Pulex-3.0.1-x64-portable.exe`.
+1. **Copy & Launch**: Copy `Pulex-3.0.2-x64-portable.exe` (directly or extracted from `Pulex-3.0.2-x64-portable.zip`) to any folder and launch it. On first launch, Pulex automatically extracts its runtime DLLs into `pulexAppData_<id>\bin\` (or `%TEMP%\pulex_runtime_3.0.2\` if run from a read-only folder).
 2. **Open Datasets**:
    - Drag and drop individual files or entire folders onto the Pulex window.
    - Use **File -> Open File... (`Ctrl+O`)** or **File -> Open Folder... (`Ctrl+Shift+O`)**.
    - Pass file, folder, or `.pulex` / `.toad` / `.tad` workspace paths directly on the command line:
      ```powershell
-     Pulex-3.0.1-x64-portable.exe C:\Logs\Security.evtx
+     Pulex-3.0.2-x64-portable.exe C:\Logs\Security.evtx
      ```
 3. **Portable AppData**:
    - Pulex creates a single local `pulexAppData_<id>` folder adjacent to the executable containing `config.ini`, `toad_ledger.parquet`, `derived_views.json`, `logs/pulex.log`, `temp/`, and `WebView2/`. No user profile or registry keys are polluted.
@@ -52,6 +52,6 @@
 ## 4. Integrity Verification (PowerShell)
 
 ```powershell
-Get-FileHash .\Pulex-3.0.1-x64-portable.zip, .\Pulex-3.0.1-x64-portable.exe -Algorithm SHA256
+Get-FileHash .\Pulex-3.0.2-x64-portable.zip, .\Pulex-3.0.2-x64-portable.exe -Algorithm SHA256
 Get-Content .\SHA256SUMS.txt
 ```

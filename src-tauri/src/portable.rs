@@ -23,6 +23,9 @@ pub struct ToadGeneralConfig {
     pub max_concurrent_gb: f64,
     pub auto_restore_last_directory: bool,
     pub last_directory: String,
+    /// Maximum row count eligible for automatic `ORDER BY timeCol DESC` on dataset open.
+    /// Default: 500000. Set 0 to disable auto-sort completely, or -1 to always auto-sort.
+    pub auto_sort_max_rows: i64,
 }
 
 impl Default for ToadGeneralConfig {
@@ -35,6 +38,7 @@ impl Default for ToadGeneralConfig {
             max_concurrent_gb: 1.0,
             auto_restore_last_directory: true,
             last_directory: String::new(),
+            auto_sort_max_rows: 500_000,
         }
     }
 }
@@ -61,6 +65,8 @@ pub struct ToadDuckDbConfig {
     pub max_memory: String,
     pub threads: u32,
     pub background_threads: String,
+    /// Parallel CSV reader policy: "auto" (parallel=true with fallback to false), "true", or "false".
+    pub csv_parallel: String,
     pub add_raw_event: bool,
 }
 
@@ -70,6 +76,7 @@ impl Default for ToadDuckDbConfig {
             max_memory: "auto".to_string(),
             threads: 0,
             background_threads: "auto".to_string(),
+            csv_parallel: "auto".to_string(),
             add_raw_event: false,
         }
     }
@@ -269,6 +276,7 @@ max_concurrent_files = {max_concurrent_files}
 max_concurrent_gb = {max_concurrent_gb}
 auto_restore_last_directory = {auto_restore_last_directory}
 last_directory = {last_directory}
+auto_sort_max_rows = {auto_sort_max_rows}
 
 [runtime]
 engine = {engine}
@@ -278,6 +286,7 @@ auto_fallback = {auto_fallback}
 max_memory = {max_memory}
 threads = {threads}
 background_threads = {background_threads}
+csv_parallel = {csv_parallel}
 add_raw_event = {add_raw_event}
 
 [parquet]
@@ -296,11 +305,13 @@ log_level = {log_level}
         max_concurrent_gb = cfg.general.max_concurrent_gb,
         auto_restore_last_directory = cfg.general.auto_restore_last_directory,
         last_directory = cfg.general.last_directory,
+        auto_sort_max_rows = cfg.general.auto_sort_max_rows,
         engine = cfg.runtime.engine,
         auto_fallback = cfg.runtime.auto_fallback,
         max_memory = cfg.duckdb.max_memory,
         threads = cfg.duckdb.threads,
         background_threads = cfg.duckdb.background_threads,
+        csv_parallel = cfg.duckdb.csv_parallel,
         add_raw_event = cfg.duckdb.add_raw_event,
         compression = cfg.parquet.compression,
         row_group_size = cfg.parquet.row_group_size,
@@ -363,6 +374,13 @@ pub fn load_or_create_config(config_path: &Path) -> std::io::Result<ToadConfig> 
         if let Some(d) = sec.get("last_directory") {
             cfg.general.last_directory = d.clone();
         }
+        if let Some(as_max) = sec.get("auto_sort_max_rows") {
+            if let Ok(val) = as_max.parse::<i64>() {
+                cfg.general.auto_sort_max_rows = val;
+            }
+        } else {
+            need_rewrite = true;
+        }
     } else {
         need_rewrite = true;
     }
@@ -393,6 +411,16 @@ pub fn load_or_create_config(config_path: &Path) -> std::io::Result<ToadConfig> 
         }
         if let Some(bg) = sec.get("background_threads") {
             cfg.duckdb.background_threads = bg.clone();
+        }
+        if let Some(cp) = sec.get("csv_parallel") {
+            let norm = cp.trim().to_ascii_lowercase();
+            if matches!(norm.as_str(), "auto" | "true" | "false") {
+                cfg.duckdb.csv_parallel = norm;
+            } else {
+                need_rewrite = true;
+            }
+        } else {
+            need_rewrite = true;
         }
         if let Some(r) = sec.get("add_raw_event") {
             cfg.duckdb.add_raw_event = r.eq_ignore_ascii_case("true");

@@ -30,6 +30,7 @@ export interface AppConfigDTO {
     page_size: number;
     max_concurrent_files: number;
     max_concurrent_gb: number;
+    auto_sort_max_rows?: number;
   };
   runtime?: {
     engine: "utility" | "legacy" | "v8" | "tauri" | "headless" | "auto";
@@ -39,6 +40,7 @@ export interface AppConfigDTO {
     max_memory: string;
     threads: number;
     background_threads: string | number;
+    csv_parallel?: string;
     add_raw_event: boolean;
   };
   parquet: {

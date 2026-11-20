@@ -1030,7 +1030,8 @@ body.col-resizing * {
 
 .project-table-container {
   width: 100%;
-  overflow-x: auto;
+  max-height: 55vh;
+  overflow: auto;
   padding: 2px 0 6px;
   box-sizing: border-box;
 }
@@ -1042,7 +1043,9 @@ body.col-resizing * {
   table-layout: fixed;
 
   thead th {
-    position: relative; // required for absolute resizer handle
+    position: sticky;
+    top: 0;
+    z-index: 5;
     padding: 3px 6px;
     font-size: 10px;
     font-weight: 700;
@@ -1050,7 +1053,7 @@ body.col-resizing * {
     letter-spacing: 0.04em;
     color: #64748b;
     border-bottom: 1px solid rgba(0, 0, 0, 0.08);
-    background: rgba(0, 0, 0, 0.02);
+    background: var(--md-sys-color-surface-container-low, #efefef);
     user-select: none;
     cursor: pointer;
     vertical-align: middle;
@@ -1429,7 +1432,7 @@ body.col-resizing * {
     thead th {
       color: #94a3b8;
       border-bottom-color: rgba(255, 255, 255, 0.08);
-      background: rgba(255, 255, 255, 0.02);
+      background: var(--md-sys-color-surface-container, #25262c);
 
       .sort-btn {
         color: #64748b;

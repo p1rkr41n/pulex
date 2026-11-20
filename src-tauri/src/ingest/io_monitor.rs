@@ -14,6 +14,20 @@ pub struct IoCounters {
     pub other_transfer_count: u64,
 }
 
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+struct MemoryStatusEx {
+    dw_length: u32,
+    dw_memory_load: u32,
+    ull_total_phys: u64,
+    ull_avail_phys: u64,
+    ull_total_page_file: u64,
+    ull_avail_page_file: u64,
+    ull_total_virtual: u64,
+    ull_avail_virtual: u64,
+    ull_avail_extended_virtual: u64,
+}
+
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
@@ -28,6 +42,28 @@ extern "system" {
     ) -> i32;
     fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
     fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn GlobalMemoryStatusEx(lpBuffer: *mut MemoryStatusEx) -> i32;
+}
+
+/// Returns total physical system RAM in bytes via Win32 `GlobalMemoryStatusEx`.
+pub fn get_total_system_ram_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    unsafe {
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            ..Default::default()
+        };
+        if GlobalMemoryStatusEx(&mut status) != 0 && status.ull_total_phys > 0 {
+            Some(status.ull_total_phys)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 /// Returns cumulative `(read_bytes, write_bytes)` for the target process ID.
@@ -83,6 +119,15 @@ mod tests {
         {
             let res = get_process_io_bytes(0);
             assert!(res.is_some(), "GetProcessIoCounters should succeed for current process");
+        }
+    }
+
+    #[test]
+    fn test_get_total_system_ram_bytes() {
+        #[cfg(windows)]
+        {
+            let ram = get_total_system_ram_bytes().expect("GlobalMemoryStatusEx should return RAM");
+            assert!(ram >= 512 * 1024 * 1024, "System RAM should be at least 512 MB");
         }
     }
 }

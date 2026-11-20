@@ -6,19 +6,24 @@
 
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 fn main() {
     tauri_build::build();
 
-    // Delay-load comctl32.dll so that headless unit tests and CLI runs
-    // do not fail with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) on Windows GNU toolchain.
+    // Delay-load comctl32.dll (for headless tests) plus duckdb.dll and WebView2Loader.dll
+    // so pulex.exe launches cleanly as a true single-file portable executable from any folder
+    // and extracts its embedded runtime DLLs into pulexAppData_<id>/bin/ before first use.
     println!("cargo:rustc-link-arg=--delayload=comctl32.dll");
+    println!("cargo:rustc-link-arg=--delayload=duckdb.dll");
+    println!("cargo:rustc-link-arg=--delayload=WebView2Loader.dll");
 
     copy_runtime_dlls();
+    embed_runtime_dlls();
 
     // Full PE Resource Embedding (RT_ICON, RT_GROUP_ICON, RT_VERSION, RT_MANIFEST)
-    // with HelloKittyXamKinLung / Pulex v3.0.0 branding.
+    // with HelloKittyXamKinLung / Pulex branding.
     embed_pe_resources();
 }
 
@@ -110,6 +115,96 @@ fn copy_runtime_dlls() {
     }
 }
 
+fn find_runtime_dll(dll_name: &str, manifest_dir: &Path, target_root: &Path) -> Option<PathBuf> {
+    let mut candidate_sources: Vec<PathBuf> = Vec::new();
+    if dll_name == "duckdb.dll" {
+        if let Ok(env_dir) = env::var("DUCKDB_LIB_DIR") {
+            candidate_sources.push(PathBuf::from(env_dir).join(dll_name));
+        }
+    }
+    candidate_sources.push(manifest_dir.join("lib").join(dll_name));
+    candidate_sources.push(manifest_dir.join(dll_name));
+    if let Some(workspace_root) = manifest_dir.parent() {
+        candidate_sources.push(workspace_root.join(dll_name));
+    }
+    candidate_sources.push(target_root.join("debug").join(dll_name));
+    candidate_sources.push(target_root.join("debug").join("deps").join(dll_name));
+    candidate_sources.push(target_root.join("release").join(dll_name));
+    candidate_sources.push(target_root.join("release").join("deps").join(dll_name));
+    candidate_sources.into_iter().find(|p| p.is_file())
+}
+
+/// Compress duckdb.dll and WebView2Loader.dll with gzip into OUT_DIR for single-file .exe embedding.
+fn embed_runtime_dlls() {
+    let out_dir = match env::var("OUT_DIR") {
+        Ok(val) => PathBuf::from(val),
+        Err(_) => return,
+    };
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into()));
+    let target_root = out_dir
+        .ancestors()
+        .find(|p| p.file_name().map_or(false, |name| name == "build"))
+        .and_then(|build_dir| build_dir.parent())
+        .and_then(|profile_dir| profile_dir.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| manifest_dir.join("target"));
+
+    let mut duckdb_len: u64 = 0;
+    let mut webview_len: u64 = 0;
+
+    for dll_name in &["duckdb.dll", "WebView2Loader.dll"] {
+        let gz_path = out_dir.join(format!("{}.gz", dll_name));
+        let marker_path = out_dir.join(format!("{}.size", dll_name));
+
+        if let Some(src_path) = find_runtime_dll(dll_name, &manifest_dir, &target_root) {
+            println!("cargo:rerun-if-changed={}", src_path.display());
+            let src_len = fs::metadata(&src_path).map(|m| m.len()).unwrap_or(0);
+            if *dll_name == "duckdb.dll" {
+                duckdb_len = src_len;
+            } else {
+                webview_len = src_len;
+            }
+
+            let cached_ok = gz_path.is_file()
+                && fs::read_to_string(&marker_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    == Some(src_len);
+
+            if !cached_ok {
+                let mut src_file = fs::File::open(&src_path)
+                    .unwrap_or_else(|e| panic!("Failed to open {}: {}", src_path.display(), e));
+                let mut raw = Vec::with_capacity(src_len as usize);
+                src_file
+                    .read_to_end(&mut raw)
+                    .unwrap_or_else(|e| panic!("Failed to read {}: {}", src_path.display(), e));
+
+                let out_file = fs::File::create(&gz_path)
+                    .unwrap_or_else(|e| panic!("Failed to create {}: {}", gz_path.display(), e));
+                let mut encoder = flate2::write::GzEncoder::new(out_file, flate2::Compression::best());
+                encoder
+                    .write_all(&raw)
+                    .unwrap_or_else(|e| panic!("Failed to compress {}: {}", dll_name, e));
+                encoder
+                    .finish()
+                    .unwrap_or_else(|e| panic!("Failed to finalize gzip for {}: {}", dll_name, e));
+                let _ = fs::write(&marker_path, src_len.to_string());
+            }
+        } else {
+            // Write empty placeholder so non-Windows / partial check builds still compile
+            if !gz_path.exists() {
+                let _ = fs::write(&gz_path, &[]);
+            }
+        }
+    }
+
+    let meta_rs = format!(
+        "pub const DUCKDB_DLL_LEN: u64 = {};\npub const WEBVIEW2_DLL_LEN: u64 = {};\n",
+        duckdb_len, webview_len
+    );
+    let _ = fs::write(out_dir.join("embedded_dll_meta.rs"), meta_rs);
+}
+
 fn copy_if_different(from: &Path, to: &Path) -> std::io::Result<()> {
     if from == to {
         return Ok(());
@@ -188,12 +283,12 @@ fn build_version_info() -> Vec<u8> {
     let strings = [
         ("CompanyName", "HelloKittyXamKinLung"),
         ("FileDescription", "Pulex Data Analyzer"),
-        ("FileVersion", "3.0.1"),
+        ("FileVersion", "3.0.2"),
         ("InternalName", "pulex.exe"),
         ("LegalCopyright", "Copyright \u{00A9} 2026 HelloKittyXamKinLung"),
         ("OriginalFilename", "pulex.exe"),
         ("ProductName", "Pulex"),
-        ("ProductVersion", "3.0.1"),
+        ("ProductVersion", "3.0.2"),
     ];
 
     let mut str_entries = Vec::new();
@@ -261,11 +356,11 @@ fn build_version_info() -> Vec<u8> {
     let vfi_len = vfi.len() as u16;
     vfi[0..2].copy_from_slice(&vfi_len.to_le_bytes());
 
-    // VS_FIXEDFILEINFO (52 bytes): 3.0.1.0
+    // VS_FIXEDFILEINFO (52 bytes): 3.0.2.0
     let file_ver_ms: u32 = 3 << 16;
-    let file_ver_ls: u32 = 1 << 16;
+    let file_ver_ls: u32 = 2 << 16;
     let prod_ver_ms: u32 = 3 << 16;
-    let prod_ver_ls: u32 = 1 << 16;
+    let prod_ver_ls: u32 = 2 << 16;
     let mut ffi = Vec::new();
     ffi.extend_from_slice(&0xFEEF04BDu32.to_le_bytes());
     ffi.extend_from_slice(&0x00010000u32.to_le_bytes());
@@ -302,7 +397,7 @@ fn build_version_info() -> Vec<u8> {
 fn build_manifest_xml() -> Vec<u8> {
     br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <assemblyIdentity type="win32" name="com.pulex.analyzer" version="3.0.1.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="com.pulex.analyzer" version="3.0.2.0" processorArchitecture="amd64"/>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
@@ -419,7 +514,7 @@ fn generate_resource_coff(dest_path: &Path, ico_path: &Path) -> std::io::Result<
         }
         leaves.push(ResourceLeaf {
             type_id: 14, // RT_GROUP_ICON
-            name_id: 1,
+            name_id: 32512, // IDI_APPLICATION (resolved by both Windows Explorer and Tauri v2)
             lang_id: 0x0409,
             data: grp_dir,
         });

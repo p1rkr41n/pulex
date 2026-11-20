@@ -1,6 +1,6 @@
 [package]
 name = "pulex"
-version = "3.0.1"
+version = "3.0.2"
 description = "Pulex Data Analyzer"
 authors = ["HelloKittyXamKinLung <p1rkr41n@users.noreply.github.com>"]
 edition = "2021"
@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+flate2 = "1.1"
 
 [profile.release]
 opt-level = 3

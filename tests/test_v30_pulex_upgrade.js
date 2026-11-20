@@ -82,14 +82,24 @@ function runUpgradeTests() {
 
   console.log(`${BOLD}${YELLOW}--- SECTION 1: XSS, CSP & URL Sanitization (G-11, G-13, G-14) ---${RESET}`);
 
-  test("1.1 TextFormatOptions escapes HTML/XSS payloads in URLs and removes inline onclick", () => {
-    const tf = new TextFormatOptions({ urlsAsLinks: true });
+  test("1.1 TextFormatOptions enforces plain-text URL safe mode, blocks openURL, and escapes HTML/XSS payloads", () => {
+    const tf = new TextFormatOptions({ urlsAsHyperlinks: true });
     const formatter = tf.getFormatter();
 
     const safeHtml = formatter("https://example.com/report?id=1&tag=sec");
-    assert.ok(safeHtml.includes("<a "), "Valid https URL should render anchor");
+    assert.ok(!safeHtml.includes("<a "), "URLs must always render as plain text, never <a> anchors");
+    assert.ok(!safeHtml.includes("href="), "URLs must never emit href attributes");
     assert.ok(!safeHtml.includes("onclick="), "Must never emit inline onclick attribute");
-    assert.ok(safeHtml.includes("rel=\"noopener noreferrer\""), "Must include noopener noreferrer");
+    assert.ok(
+      safeHtml.includes("https://example.com/report?id=1") &&
+      (safeHtml.includes("&amp;tag=sec") || safeHtml.includes("&#x26;tag=sec")),
+      "URL text must be HTML-escaped plain text"
+    );
+
+    let openedUrl = null;
+    const clickHandler = tf.getClickHandler();
+    clickHandler({ openURL: (u) => { openedUrl = u; } }, 0, 0, "https://evil.example/malware.exe");
+    assert.strictEqual(openedUrl, null, "Clicking a URL cell must never invoke openURL");
 
     const xssPayload = 'https://evil.example/" onmouseover="alert(1)" <script>alert(2)</script>';
     const rendered = formatter(xssPayload);

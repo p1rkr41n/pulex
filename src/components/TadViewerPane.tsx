@@ -52,8 +52,8 @@ function TadViewerPaneInner({
 }: TadViewerPaneInnerProps) {
   const viewerPane = useRef<JSX.Element | null>(null);
 
-  const openURL = (url: string) => {
-    window.open(url, "_blank");
+  const openURL = (_url: string) => {
+    // Plain-text URL safe mode: never launch external URLs from data cells
   };
 
   if (viewerPane.current == null) {
@@ -125,8 +125,8 @@ export function TadViewerPane({
     null
   );
 
-  const openURL = (url: string) => {
-    window.open(url, "_blank");
+  const openURL = (_url: string) => {
+    // Plain-text URL safe mode: never launch external URLs from data cells
   };
 
   React.useEffect(() => {

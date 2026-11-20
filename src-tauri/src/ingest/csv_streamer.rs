@@ -14,12 +14,43 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use duckdb::Connection;
+use flate2::read::MultiGzDecoder;
 
 use crate::engine::fast_count::FastCounter;
 use crate::ingest::dirty_log::ingest_dirty_log;
 use crate::ingest::progress::ProgressDispatcher;
 use crate::ingest::scheduler::CancellationToken;
 use crate::ingest::transcode::{detect_text_encoding, transcode_to_utf8, DetectedEncoding};
+
+#[derive(Debug, Clone)]
+pub struct CsvIngestOptions {
+    /// "auto" (parallel=true with fallback to false), "true", or "false"
+    pub csv_parallel: String,
+    /// Parquet compression codec: "snappy", "zstd", "gzip", or "uncompressed"
+    pub compression: String,
+    /// Parquet output row group size (default 25000 for optimal DuckDB 1.2.2 parallel writer throughput)
+    pub row_group_size: u64,
+}
+
+impl Default for CsvIngestOptions {
+    fn default() -> Self {
+        Self {
+            csv_parallel: "auto".to_string(),
+            compression: "snappy".to_string(),
+            row_group_size: 25_000,
+        }
+    }
+}
+
+/// Normalize Parquet compression codec name into a safe DuckDB SQL keyword.
+pub fn sanitize_parquet_compression(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "zstd" => "ZSTD",
+        "gzip" => "GZIP",
+        "uncompressed" | "none" => "UNCOMPRESSED",
+        _ => "SNAPPY",
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CsvIngestResult {
@@ -49,23 +80,7 @@ pub fn effective_extension(file_path: &Path) -> String {
     ext
 }
 
-/// Sniff the most likely delimiter from the first 50 lines of a delimited UTF-8 file.
-/// Applies RFC-4180 quote escaping rules and line consistency scoring.
-pub fn sniff_delimiter(file_path: &Path) -> char {
-    let ext = effective_extension(file_path);
-
-    let extension_hint = match ext.as_str() {
-        "tsv" | "tab" => '\t',
-        "csv" => ',',
-        _ => ',',
-    };
-
-    let file = match File::open(file_path) {
-        Ok(f) => f,
-        Err(_) => return extension_hint,
-    };
-
-    let reader = BufReader::new(file);
+fn sniff_delimiter_from_reader<R: BufRead>(reader: R, extension_hint: char) -> char {
     let mut line_counts: [Vec<usize>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut sampled_lines = 0usize;
 
@@ -128,6 +143,34 @@ pub fn sniff_delimiter(file_path: &Path) -> char {
     best_delimiter
 }
 
+/// Sniff the most likely delimiter from the first 50 lines of a delimited UTF-8 or `.gz` file.
+/// Applies RFC-4180 quote escaping rules and line consistency scoring.
+pub fn sniff_delimiter(file_path: &Path) -> char {
+    let ext = effective_extension(file_path);
+
+    let extension_hint = match ext.as_str() {
+        "tsv" | "tab" => '\t',
+        "csv" => ',',
+        _ => ',',
+    };
+
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(_) => return extension_hint,
+    };
+
+    if file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map_or(false, |e| e.eq_ignore_ascii_case("gz"))
+    {
+        let gz_reader = BufReader::new(MultiGzDecoder::new(file));
+        return sniff_delimiter_from_reader(gz_reader, extension_hint);
+    }
+
+    sniff_delimiter_from_reader(BufReader::new(file), extension_hint)
+}
+
 fn count_delimiters_in_line(line: &str) -> [usize; 4] {
     let mut counts = [0usize; 4];
     let mut in_quotes = false;
@@ -165,12 +208,33 @@ impl Drop for TempFileCleanup {
     }
 }
 
-/// Ingest a CSV/TSV (including `.gz` and UTF-16LE/BE) file using DuckDB 3-tier fallback matrix into compressed Parquet.
+/// Ingest a CSV/TSV (including `.gz` and UTF-16LE/BE) file using default high-speed options.
 pub fn ingest_csv_file(
     file_id: &str,
     source_path: &Path,
     target_parquet_path: &Path,
     conn: &Connection,
+    cancellation_token: &CancellationToken,
+    dispatcher: Option<&ProgressDispatcher>,
+) -> Result<CsvIngestResult, String> {
+    ingest_csv_file_with_options(
+        file_id,
+        source_path,
+        target_parquet_path,
+        conn,
+        &CsvIngestOptions::default(),
+        cancellation_token,
+        dispatcher,
+    )
+}
+
+/// Ingest a CSV/TSV (including `.gz` and UTF-16LE/BE) file using configurable DuckDB 3-tier fallback matrix.
+pub fn ingest_csv_file_with_options(
+    file_id: &str,
+    source_path: &Path,
+    target_parquet_path: &Path,
+    conn: &Connection,
+    opts: &CsvIngestOptions,
     cancellation_token: &CancellationToken,
     dispatcher: Option<&ProgressDispatcher>,
 ) -> Result<CsvIngestResult, String> {
@@ -192,11 +256,17 @@ pub fn ingest_csv_file(
         let _ = std::fs::remove_file(&temp_out);
     }
 
-    // Transparent streaming UTF-8 transcoding ONLY for .gz and UTF-16LE/BE.
-    // DuckDB read_csv natively handles UTF-8 BOM (EF BB BF) directly without
-    // incurring a full-file disk copy on multi-gigabyte CSV datasets.
+    // Native DuckDB fast paths:
+    // - UTF-8 / UTF-8 BOM: read directly (zero disk copy).
+    // - UTF-8 .gz: read natively via DuckDB `compression = 'gzip'` (zero disk copy, 2.28x faster).
+    // - UTF-16LE/BE (plain or inside .gz): stream-transcode to UTF-8 temp file.
     let mut transcoded_guard = TempFileCleanup(None);
+    let mut is_native_gzip = false;
     let working_source: PathBuf = match detect_text_encoding(source_path) {
+        Ok(DetectedEncoding::GzipUtf8) => {
+            is_native_gzip = true;
+            source_path.to_path_buf()
+        }
         Ok(enc) if enc.needs_utf8_transcode() && enc != DetectedEncoding::Utf8Bom => {
             let inner_ext = effective_extension(source_path);
             let transcode_ext = if inner_ext.is_empty() { "csv" } else { inner_ext.as_str() };
@@ -234,34 +304,57 @@ pub fn ingest_csv_file(
         return Err("Ingestion cancelled by user".to_string());
     }
 
+    let compression_sql = sanitize_parquet_compression(&opts.compression);
+    let rg_size = if opts.row_group_size >= 1000 {
+        opts.row_group_size
+    } else {
+        25_000
+    };
+    let gzip_clause = if is_native_gzip {
+        ", compression = 'gzip'"
+    } else {
+        ""
+    };
+
+    let try_parallel = !opts.csv_parallel.eq_ignore_ascii_case("false");
+    let allow_serial_fallback = !opts.csv_parallel.eq_ignore_ascii_case("true");
+
     // Spawn real-time I/O & Parquet growth progress ticker during blocking DuckDB COPY
     let _progress_ticker = dispatcher.map(|disp| {
         disp.spawn_copy_progress_ticker(file_id, source_path, &working_source, &temp_out, 0.22)
     });
 
-    // Tier 0: Standard auto_detect with all_varchar guard and parallel=false
+    // Tier 0: Parallel-first auto_detect with all_varchar guard and config-driven Parquet output
     let tier0_sql = format!(
-        "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = 100000, ignore_errors = true, null_padding = true, all_varchar = true, parallel = false)) TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880);",
+        "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = 100000, ignore_errors = true, null_padding = true, all_varchar = true, parallel = {par}{gz})) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
         src = safe_src,
         delim = delim_str,
-        dst = safe_dst
+        par = try_parallel,
+        gz = gzip_clause,
+        dst = safe_dst,
+        comp = compression_sql,
+        rg = rg_size
     );
 
     let mut tier_used = 0u8;
     let mut exec_result = conn.execute_batch(&tier0_sql);
 
-    // Tier 1: Force header=true and quote='' safe mode if Tier 0 fails
-    if exec_result.is_err() && !cancellation_token.is_cancelled() {
+    // Tier 1: Safe serial fallback (parallel=false, header=true, quote='') when Tier 0 fails
+    if exec_result.is_err() && allow_serial_fallback && !cancellation_token.is_cancelled() {
         tracing::warn!(
-            "CSV Tier 0 failed ({:?}); attempting Tier 1 safe quote/header mode",
+            "CSV Tier 0 (parallel={}) failed ({:?}); attempting Tier 1 safe serial quote/header mode",
+            try_parallel,
             exec_result.as_ref().err()
         );
         let _ = std::fs::remove_file(&temp_out);
         let tier1_sql = format!(
-            "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = 100000, header = true, quote = '', ignore_errors = true, null_padding = true, all_varchar = true, parallel = false)) TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880);",
+            "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = 100000, header = true, quote = '', ignore_errors = true, null_padding = true, all_varchar = true, parallel = false{gz})) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
             src = safe_src,
             delim = delim_str,
-            dst = safe_dst
+            gz = gzip_clause,
+            dst = safe_dst,
+            comp = compression_sql,
+            rg = rg_size
         );
         tier_used = 1;
         exec_result = conn.execute_batch(&tier1_sql);
@@ -365,6 +458,47 @@ mod tests {
             )
             .expect("describe parquet");
         assert_eq!(first_col, "Timestamp", "UTF-8 BOM should be stripped cleanly by DuckDB read_csv");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_native_gzip_csv_zero_temp_transcode_and_zstd_config() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let tmp_dir = std::env::temp_dir().join(format!("pulex_native_gz_csv_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+
+        let src_gz = tmp_dir.join("logs.csv.gz");
+        let dst_pq = tmp_dir.join("logs.parquet");
+
+        {
+            let f = File::create(&src_gz).expect("create gz");
+            let mut enc = GzEncoder::new(f, Compression::fast());
+            enc.write_all(b"Timestamp,Host,Action\n2026-01-01T00:00:00Z,WS01,ALLOW\n2026-01-01T00:00:05Z,WS02,BLOCK\n")
+                .expect("write gz");
+            enc.finish().expect("finish gz");
+        }
+
+        let conn = Connection::open_in_memory().expect("open duckdb");
+        let ct = CancellationToken::new();
+        let opts = CsvIngestOptions {
+            csv_parallel: "auto".to_string(),
+            compression: "zstd".to_string(),
+            row_group_size: 25_000,
+        };
+        let res = ingest_csv_file_with_options("f_gz", &src_gz, &dst_pq, &conn, &opts, &ct, None)
+            .expect("native gzip CSV ingest should succeed");
+        assert_eq!(res.row_count, 2);
+        assert_eq!(res.tier_used, 0);
+        assert!(dst_pq.exists());
+        assert!(
+            !dst_pq.with_extension("utf8_tmp.csv").exists(),
+            "Native gzip CSV must not create intermediate utf8_tmp.csv file"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

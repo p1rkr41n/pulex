@@ -1,5 +1,5 @@
 PackageIdentifier: HelloKittyXamKinLung.Pulex
-PackageVersion: 3.0.1
+PackageVersion: 3.0.2
 PackageLocale: en-US
 Publisher: HelloKittyXamKinLung
 PackageName: Pulex
@@ -17,9 +17,9 @@ Installers:
     InstallerType: zip
     NestedInstallerType: portable
     NestedInstallerFiles:
-      - RelativeFilePath: Pulex-3.0.1-x64-portable.exe
+      - RelativeFilePath: Pulex-3.0.2-x64-portable.exe
         PortableCommandAlias: pulex
-    InstallerUrl: https://github.com/p1rkr41n/pulex/releases/download/v3.0.1/Pulex-3.0.1-x64-portable.zip
-    InstallerSha256: A2FFF91839E70AFDADE481938B8A99A7AAC41A08C0963ECF45C0734F06C57080
+    InstallerUrl: https://github.com/p1rkr41n/pulex/releases/download/v3.0.2/Pulex-3.0.2-x64-portable.zip
+    InstallerSha256: 8C30B6E22F09B501BD3AE986A4156CC482E3DD2B6A0C013CC154EAD75DEC923C
 ManifestType: singleton
 ManifestVersion: 1.6.0

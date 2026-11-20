@@ -7,10 +7,12 @@
 use crate::engine::query_compiler::{QueryExpCompiler, QueryRep};
 use crate::engine::stats_cache::{ColumnStatsDto, ColumnStatsMap};
 use crate::ingest::binary_guard::{inspect_file, FileFormatCategory};
-use crate::ingest::csv_streamer::{effective_extension, ingest_csv_file};
-use crate::ingest::dirty_log::ingest_dirty_log;
+use crate::ingest::csv_streamer::{
+    effective_extension, ingest_csv_file_with_options, CsvIngestOptions,
+};
+use crate::ingest::dirty_log::ingest_dirty_log_duckdb;
 use crate::ingest::evtx_parser::ingest_evtx_file;
-use crate::ingest::jsonl_streamer::ingest_jsonl_file;
+use crate::ingest::jsonl_streamer::ingest_jsonl_file_with_options;
 use crate::ingest::scheduler::CancellationToken;
 use crate::ledger::parquet_ledger::{build_cache_parquet_name, compute_cache_hash};
 use crate::state::{AppState, DerivedViewSpec};
@@ -424,10 +426,17 @@ pub async fn handle_get_table_name(
         let src_buf = path_obj.to_path_buf();
         let dst_buf = target_pq.clone();
 
+        let csv_opts = CsvIngestOptions {
+            csv_parallel: cfg.duckdb.csv_parallel.clone(),
+            compression: cfg.parquet.compression.clone(),
+            row_group_size: cfg.parquet.row_group_size,
+        };
+        let evtx_threads = pool.resolve_worker_threads(1);
+
         if format_cat == FileFormatCategory::Evtx || ext == "evtx" {
             let disp_bg = dispatcher.clone();
             let res = tokio::task::spawn_blocking(move || {
-                ingest_evtx_file(&fid, &src_buf, &dst_buf, 4, &ct, Some(&disp_bg))
+                ingest_evtx_file(&fid, &src_buf, &dst_buf, evtx_threads, &ct, Some(&disp_bg))
             })
             .await
             .map_err(|e| e.to_string())?;
@@ -437,8 +446,20 @@ pub async fn handle_get_table_name(
             || matches!(ext.as_str(), "json" | "jsonl" | "ndjson")
         {
             let disp_bg = dispatcher.clone();
+            let comp = csv_opts.compression.clone();
+            let rg = csv_opts.row_group_size;
             pool.run_ingest_task(move |conn| {
-                ingest_jsonl_file(&fid, &src_buf, &dst_buf, &conn, &ct, Some(&disp_bg)).map(|_| ())
+                ingest_jsonl_file_with_options(
+                    &fid,
+                    &src_buf,
+                    &dst_buf,
+                    &conn,
+                    &comp,
+                    rg,
+                    &ct,
+                    Some(&disp_bg),
+                )
+                .map(|_| ())
             })
             .await?;
             cached_parquet_path = Some(target_pq);
@@ -447,17 +468,38 @@ pub async fn handle_get_table_name(
             && format_cat != FileFormatCategory::Utf16Text
         {
             let disp_bg = dispatcher.clone();
-            tokio::task::spawn_blocking(move || {
-                ingest_dirty_log(&fid, &src_buf, &dst_buf, &ct, Some(&disp_bg))
+            let comp = csv_opts.compression.clone();
+            let rg = csv_opts.row_group_size;
+            pool.run_ingest_task(move |conn| {
+                ingest_dirty_log_duckdb(
+                    &fid,
+                    &src_buf,
+                    &dst_buf,
+                    &conn,
+                    &comp,
+                    rg,
+                    &ct,
+                    Some(&disp_bg),
+                )
+                .map(|_| ())
             })
-            .await
-            .map_err(|e| e.to_string())??;
+            .await?;
             cached_parquet_path = Some(target_pq);
         } else {
-            // CSV / TSV / TXT / GzipText / Utf16Text -> RFC-4180 sniffer + UTF-8 transcoder + 3-tier fallback
+            // CSV / TSV / TXT / GzipText / Utf16Text -> Parallel-first 3-tier fallback + native .gz
             let disp_bg = dispatcher.clone();
+            let opts = csv_opts.clone();
             pool.run_ingest_task(move |conn| {
-                ingest_csv_file(&fid, &src_buf, &dst_buf, &conn, &ct, Some(&disp_bg)).map(|_| ())
+                ingest_csv_file_with_options(
+                    &fid,
+                    &src_buf,
+                    &dst_buf,
+                    &conn,
+                    &opts,
+                    &ct,
+                    Some(&disp_bg),
+                )
+                .map(|_| ())
             })
             .await?;
             cached_parquet_path = Some(target_pq);
@@ -864,6 +906,75 @@ fn duckdb_value_ref_to_json(v: ValueRef<'_>) -> Value {
     }
 }
 
+fn is_ddl_or_command_sql(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let first_word = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        first_word.as_str(),
+        "CREATE"
+            | "DROP"
+            | "ALTER"
+            | "ATTACH"
+            | "DETACH"
+            | "USE"
+            | "SET"
+            | "RESET"
+            | "LOAD"
+            | "INSTALL"
+            | "COPY"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "TRUNCATE"
+            | "BEGIN"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "CHECKPOINT"
+    )
+}
+
+/// Core synchronous executor for `toad:run_sql` on a DuckDB connection.
+/// Executes DDL statements via `execute_batch` and always executes `stmt.query([])`
+/// BEFORE inspecting `column_names()` (DuckDB 1.2.2 panics if `column_names()` is called before execution).
+fn execute_run_sql_on_conn(conn: &duckdb::Connection, sql_str: &str) -> Result<Value, String> {
+    if is_ddl_or_command_sql(sql_str) {
+        conn.execute_batch(sql_str).map_err(|e| e.to_string())?;
+        return Ok(Value::Array(Vec::new()));
+    }
+
+    let mut stmt = conn.prepare(sql_str).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    let col_names: Vec<String> = rows
+        .as_ref()
+        .map(|s| {
+            let count = s.column_count();
+            if count > 0 {
+                s.column_names().into_iter().map(|c| c.to_string()).collect()
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap_or_default();
+
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let mut row_map = serde_json::Map::new();
+        for (i, col_name) in col_names.iter().enumerate() {
+            let val = match row.get_ref(i) {
+                Ok(vref) => duckdb_value_ref_to_json(vref),
+                Err(_) => Value::Null,
+            };
+            row_map.insert(col_name.clone(), val);
+        }
+        results.push(Value::Object(row_map));
+    }
+    Ok(Value::Array(results))
+}
+
 /// Executes arbitrary SQL query and returns rows as JSON array of objects (supporting all DuckDB types)
 pub async fn handle_run_sql(
     _app: AppHandle,
@@ -879,29 +990,8 @@ pub async fn handle_run_sql(
 
     let pool = state.get_duckdb_pool().await;
     let sql_str = sql.to_string();
-    pool.eval_ui_conn(move |conn| {
-        let mut stmt = conn.prepare(&sql_str).map_err(|e| e.to_string())?;
-        let col_names: Vec<String> = stmt
-            .column_names()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let mut row_map = serde_json::Map::new();
-            for (i, col_name) in col_names.iter().enumerate() {
-                let val = match row.get_ref(i) {
-                    Ok(vref) => duckdb_value_ref_to_json(vref),
-                    Err(_) => Value::Null,
-                };
-                row_map.insert(col_name.clone(), val);
-            }
-            results.push(Value::Object(row_map));
-        }
-        Ok(Value::Array(results))
-    })
-    .await
+    pool.eval_ui_conn(move |conn| execute_run_sql_on_conn(conn, &sql_str))
+        .await
 }
 
 #[cfg(test)]
@@ -952,5 +1042,39 @@ mod tests {
         assert_eq!(binary_val, "00FF");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_execute_run_sql_regex_preflight_and_create_view_no_panic() {
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        conn.execute_batch(
+            "CREATE TABLE \"tbl_cert\" (URL VARCHAR); \
+             INSERT INTO \"tbl_cert\" VALUES ('https://evil.example/a.exe'), ('no-match');",
+        )
+        .expect("seed table");
+
+        // 1. Preflight SELECT with regexp_extract (exact pattern sent by applyColumnExtraction)
+        let preflight_sql = "SELECT 1 FROM (SELECT *, regexp_extract(\"URL\", 'https?://([^/]+)/(.*)', 1) AS \"host\" FROM \"tbl_cert\") _sub WHERE (\"host\" IS NULL OR \"host\" = '') LIMIT 1";
+        let preflight_res = execute_run_sql_on_conn(&conn, preflight_sql)
+            .expect("preflight SELECT must succeed without DuckDB panic");
+        let arr = preflight_res.as_array().expect("JSON array");
+        assert_eq!(arr.len(), 1);
+
+        // 2. DDL CREATE OR REPLACE VIEW
+        let create_view_sql = "CREATE OR REPLACE VIEW \"tbl_cert_rx1\" AS SELECT *, regexp_extract(\"URL\", 'https?://([^/]+)/(.*)', 1) AS \"host\", regexp_extract(\"URL\", 'https?://([^/]+)/(.*)', 2) AS \"path\" FROM \"tbl_cert\"";
+        let ddl_res = execute_run_sql_on_conn(&conn, create_view_sql)
+            .expect("CREATE OR REPLACE VIEW must succeed without panic");
+        assert_eq!(ddl_res, Value::Array(Vec::new()));
+
+        // 3. Query newly created derived view
+        let query_res = execute_run_sql_on_conn(
+            &conn,
+            "SELECT \"host\", \"path\" FROM \"tbl_cert_rx1\" WHERE \"host\" != ''",
+        )
+        .expect("SELECT from derived view must succeed");
+        let rows = query_res.as_array().expect("rows array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["host"], json!("evil.example"));
+        assert_eq!(rows[0]["path"], json!("a.exe"));
     }
 }

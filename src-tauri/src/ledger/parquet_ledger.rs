@@ -311,6 +311,20 @@ impl ParquetLedger {
         (active_id, projects)
     }
 
+    /// Single Source of Truth lookup for the currently active project ID from live in-memory state.
+    pub async fn get_active_project_id(&self) -> String {
+        let state = self.state.read().await;
+        if !state.active_project_id.is_empty() && state.projects.contains_key(&state.active_project_id) {
+            return state.active_project_id.clone();
+        }
+        state
+            .projects
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
     /// Read active files for a specific project
     pub async fn get_project_files(&self, project_id: &str) -> Vec<ProjectWorkspaceFileDto> {
         let state = self.state.read().await;
@@ -489,8 +503,11 @@ impl ParquetLedger {
         Ok((file_count, freed_bytes))
     }
 
-    /// Delete all projects and compact/reset ledger to 0 rows
+    /// Delete all projects, compact/reset ledger to 0 rows, and atomically seed a single clean Untitled-1 project
     pub async fn delete_all_projects(&self) -> Result<(usize, u64), String> {
+        // Cancel any pending 500ms debounce auto-recovery timer so it can never race and create a second Untitled-1
+        self.cancel_debounce_recovery();
+
         let (project_count, total_bytes) = {
             let state = self.state.read().await;
             let count = state.projects.len();
@@ -506,21 +523,68 @@ impl ParquetLedger {
         let temp_dir = self.temp_dir.clone();
         tokio::task::spawn_blocking(move || {
             let _ = CacheCleaner::purge_all_caches(&temp_dir);
-        });
+        })
+        .await
+        .map_err(|e| format!("Purge join error: {}", e))?;
 
         // Compact reset ledger WAL to a clean 0-row Parquet file
         self.compact_reset_ledger().await?;
 
-        // Clear in-memory projection
+        // Atomically seed a single clean Untitled-1 default project (zero empty-workspace race window)
+        let new_id = generate_project_id();
+        let now_ms = current_time_ms();
+        let seed_ev = LedgerEvent {
+            event_id: generate_uuid_v4(),
+            event_type: "PROJECT_CREATED".to_string(),
+            timestamp: now_ms,
+            project_id: new_id.clone(),
+            project_name: Some("Untitled-1".to_string()),
+            file_id: None,
+            file_path: None,
+            file_size: None,
+            file_type: None,
+            source_mtime: None,
+            parquet_path: None,
+            parquet_size: None,
+            row_count: None,
+            status: Some("READY".to_string()),
+            duration_ms: None,
+            metadata_json: Some("{}".to_string()),
+        };
+
+        let _ = fs::create_dir_all(self.temp_dir.join(&new_id));
+        self.append_events(&[seed_ev]).await?;
+
+        // Reset in-memory projection to contain strictly the single clean Untitled-1 project
         {
             let mut state = self.state.write().await;
             state.projects.clear();
             state.files.clear();
-            state.active_project_id.clear();
+            state.projects.insert(
+                new_id.clone(),
+                ProjectInfo {
+                    project_id: new_id.clone(),
+                    project_name: "Untitled-1".to_string(),
+                    status: "READY".to_string(),
+                    created_at: now_ms,
+                    is_orphan: false,
+                },
+            );
+            state.active_project_id = new_id.clone();
         }
 
-        // Schedule 500ms debounce auto-recovery to regenerate Untitled-1
-        self.schedule_debounce_recovery();
+        if let Ok(guard) = self.app_handle.read() {
+            if let Some(ref handle) = *guard {
+                use tauri::Emitter;
+                let _ = handle.emit(
+                    "project:workspaceChanged",
+                    serde_json::json!({
+                        "activeProjectId": new_id,
+                        "reason": "deleteAllReset"
+                    }),
+                );
+            }
+        }
 
         Ok((project_count, total_bytes))
     }
@@ -583,6 +647,17 @@ impl ParquetLedger {
                 .unwrap_or("")
                 .to_string();
 
+            let initial_status = if ext == "parquet"
+                || (parquet_path.exists()
+                    && fs::metadata(&parquet_path)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false))
+            {
+                "READY"
+            } else {
+                "PENDING"
+            };
+
             let ev = LedgerEvent {
                 event_id: generate_uuid_v4(),
                 event_type: "FILE_ADDED".to_string(),
@@ -597,7 +672,7 @@ impl ParquetLedger {
                 parquet_path: Some(parquet_path_str.clone()),
                 parquet_size: Some(0),
                 row_count: Some(row_count),
-                status: Some("READY".to_string()),
+                status: Some(initial_status.to_string()),
                 duration_ms: Some(0),
                 metadata_json: Some("{}".to_string()),
             };
@@ -609,7 +684,7 @@ impl ParquetLedger {
                 project_name: prj_name.clone(),
                 file_size_bytes: size,
                 row_count,
-                status: "READY".to_string(),
+                status: initial_status.to_string(),
                 parquet_path: parquet_path_str.clone(),
                 folder_root: None,
                 folder_name: None,
@@ -738,6 +813,17 @@ impl ParquetLedger {
             })
             .to_string();
 
+            let initial_status = if ext == "parquet"
+                || (parquet_path.exists()
+                    && fs::metadata(&parquet_path)
+                        .map(|m| m.len() > 0)
+                        .unwrap_or(false))
+            {
+                "READY"
+            } else {
+                "PENDING"
+            };
+
             let ev = LedgerEvent {
                 event_id: generate_uuid_v4(),
                 event_type: "FILE_ADDED".to_string(),
@@ -752,7 +838,7 @@ impl ParquetLedger {
                 parquet_path: Some(parquet_path_str.clone()),
                 parquet_size: Some(0),
                 row_count: Some(row_count),
-                status: Some("READY".to_string()),
+                status: Some(initial_status.to_string()),
                 duration_ms: Some(0),
                 metadata_json: Some(meta_json),
             };
@@ -764,7 +850,7 @@ impl ParquetLedger {
                 project_name: prj_name.clone(),
                 file_size_bytes: size,
                 row_count,
-                status: "READY".to_string(),
+                status: initial_status.to_string(),
                 parquet_path: parquet_path_str,
                 folder_root: Some(folder_path.to_string()),
                 folder_name: Some(folder_name.clone()),
@@ -1705,4 +1791,45 @@ pub struct ProjectWorkspaceFileDto {
     pub folder_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rel_path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_delete_all_projects_seeds_single_clean_untitled_project() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "pulex_ledger_delete_all_{}_{}",
+            std::process::id(),
+            current_time_ms()
+        ));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let ledger = ParquetLedger::new(tmp_dir.clone());
+
+        let p1 = ledger.create_project("Alpha", None).await.expect("create Alpha");
+        let _p2 = ledger.create_project("Beta", None).await.expect("create Beta");
+        assert_eq!(ledger.get_workspace().await.1.len(), 2);
+
+        let csv_path = tmp_dir.join("sample.csv");
+        fs::write(&csv_path, "a,b\n1,2\n").expect("write csv");
+        let added = ledger
+            .add_files_to_project(&p1, vec![csv_path.to_string_lossy().to_string()])
+            .await
+            .expect("add csv");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].status, "PENDING", "Un-ingested CSV must start as PENDING");
+
+        ledger.delete_all_projects().await.expect("delete all");
+
+        // Immediately after delete_all_projects, workspace must have strictly 1 clean Untitled-1
+        let (active_id, projects) = ledger.get_workspace().await;
+        assert_eq!(projects.len(), 1, "Must have strictly 1 Untitled-1 project after delete_all");
+        assert_eq!(projects[0].project_name, "Untitled-1");
+        assert_eq!(projects[0].file_count, 0);
+        assert_eq!(active_id, projects[0].project_id);
+        assert_eq!(ledger.get_active_project_id().await, active_id);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
 }

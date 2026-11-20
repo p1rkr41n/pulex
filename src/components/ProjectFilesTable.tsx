@@ -302,7 +302,7 @@ export const ProjectFilesTable: React.FC<ProjectFilesTableProps> = ({
       if (item.status === "ready") return { status: "READY" };
       if (item.status === "modified") return { status: "MODIFIED" };
       if (item.status === "error") return { status: "ERROR" };
-      if (item.status === "pending") return { status: "PENDING" };
+      if (item.status === "pending" || item.status === "idle") return { status: "PENDING" };
     }
 
     if (stateRef) {
@@ -412,8 +412,12 @@ export const ProjectFilesTable: React.FC<ProjectFilesTableProps> = ({
   };
 
   const handleRowClick = (f: ProjectWorkspaceFile) => {
-    if (selectedRowPath && normPath(selectedRowPath) === normPath(f.filePath)) {
-      setSelectedRowPath(null); // toggle collapse
+    const isAlreadySelected =
+      selectedRowPath && normPath(selectedRowPath) === normPath(f.filePath);
+    const isAlreadyActive =
+      activeFilePath && normPath(activeFilePath) === normPath(f.filePath);
+    if (isAlreadySelected && isAlreadyActive) {
+      setSelectedRowPath(null); // toggle collapse only when already open in grid
     } else {
       setSelectedRowPath(f.filePath);
       onOpenFile(f);
@@ -665,7 +669,9 @@ export const ProjectFilesTable: React.FC<ProjectFilesTableProps> = ({
         <tbody>
           {displayedFiles.length === 0 ? (
             <tr className="empty-row">
-              <td colSpan={4}>No files matching filter</td>
+              <td colSpan={4}>
+                {files.length === 0 ? "No files in project" : "No files matching filter"}
+              </td>
             </tr>
           ) : (
             displayedFiles.map((f) => {

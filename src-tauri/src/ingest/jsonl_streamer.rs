@@ -14,6 +14,7 @@ use std::time::Instant;
 use duckdb::Connection;
 
 use crate::engine::fast_count::FastCounter;
+use crate::ingest::csv_streamer::sanitize_parquet_compression;
 use crate::ingest::dirty_log::ingest_dirty_log;
 use crate::ingest::progress::ProgressDispatcher;
 use crate::ingest::scheduler::CancellationToken;
@@ -126,6 +127,29 @@ pub fn ingest_jsonl_file(
     cancellation_token: &CancellationToken,
     dispatcher: Option<&ProgressDispatcher>,
 ) -> Result<JsonlIngestResult, String> {
+    ingest_jsonl_file_with_options(
+        file_id,
+        source_path,
+        target_parquet_path,
+        conn,
+        "snappy",
+        25_000,
+        cancellation_token,
+        dispatcher,
+    )
+}
+
+/// Ingest a JSON / JSONL / NDJSON file with configurable Parquet compression and row group size.
+pub fn ingest_jsonl_file_with_options(
+    file_id: &str,
+    source_path: &Path,
+    target_parquet_path: &Path,
+    conn: &Connection,
+    compression: &str,
+    row_group_size: u64,
+    cancellation_token: &CancellationToken,
+    dispatcher: Option<&ProgressDispatcher>,
+) -> Result<JsonlIngestResult, String> {
     let t0 = Instant::now();
 
     if let Some(disp) = dispatcher {
@@ -216,19 +240,26 @@ pub fn ingest_jsonl_file(
         disp.spawn_copy_progress_ticker(file_id, source_path, &working_source, &temp_out, 0.25)
     });
 
+    let comp_sql = sanitize_parquet_compression(compression);
+    let rg_size = if row_group_size >= 1000 { row_group_size } else { 25_000 };
+
     let unnested_count = projections.len();
     let copy_sql = if has_structs && !projections.is_empty() {
         format!(
-            "COPY (SELECT {projections} FROM read_json_auto('{src}', sample_size = 2048, ignore_errors = true, maximum_object_size = 67108864)) TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880);",
+            "COPY (SELECT {projections} FROM read_json_auto('{src}', sample_size = 2048, ignore_errors = true, maximum_object_size = 67108864)) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
             projections = projections.join(", "),
             src = safe_src,
-            dst = safe_dst
+            dst = safe_dst,
+            comp = comp_sql,
+            rg = rg_size
         )
     } else {
         format!(
-            "COPY (SELECT * FROM read_json_auto('{src}', sample_size = 2048, ignore_errors = true, maximum_object_size = 67108864)) TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880);",
+            "COPY (SELECT * FROM read_json_auto('{src}', sample_size = 2048, ignore_errors = true, maximum_object_size = 67108864)) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
             src = safe_src,
-            dst = safe_dst
+            dst = safe_dst,
+            comp = comp_sql,
+            rg = rg_size
         )
     };
 
@@ -238,9 +269,11 @@ pub fn ingest_jsonl_file(
         tracing::warn!("Unnested JSON projection failed; falling back to flat read_json_auto");
         let _ = std::fs::remove_file(&temp_out);
         let fallback_sql = format!(
-            "COPY (SELECT * FROM read_json_auto('{src}', sample_size = 2048, ignore_errors = true, maximum_object_size = 67108864)) TO '{dst}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 122880);",
+            "COPY (SELECT * FROM read_json_auto('{src}', sample_size = 2048, ignore_errors = true, maximum_object_size = 67108864)) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
             src = safe_src,
-            dst = safe_dst
+            dst = safe_dst,
+            comp = comp_sql,
+            rg = rg_size
         );
         exec_result = conn.execute_batch(&fallback_sql);
     }

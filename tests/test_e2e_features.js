@@ -524,13 +524,13 @@ async function runE2EFeaturesTests() {
   test("T1.11 (F32, F33): Production Portable Packaging & Identity Standard", () => {
     const author = "HelloKittyXamKinLung";
     const email = "p1rkr41n@users.noreply.github.com";
-    const version = "3.0.1";
+    const version = "3.0.2";
 
     const expectedExe = `Pulex-${version}-x64-portable.exe`;
     const expectedZip = `Pulex-${version}-x64-portable.zip`;
 
-    assert.strictEqual(expectedExe, "Pulex-3.0.1-x64-portable.exe");
-    assert.strictEqual(expectedZip, "Pulex-3.0.1-x64-portable.zip");
+    assert.strictEqual(expectedExe, "Pulex-3.0.2-x64-portable.exe");
+    assert.strictEqual(expectedZip, "Pulex-3.0.2-x64-portable.zip");
     assert.strictEqual(`${author} <${email}>`, "HelloKittyXamKinLung <p1rkr41n@users.noreply.github.com>");
   });
 

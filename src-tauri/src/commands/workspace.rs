@@ -184,10 +184,10 @@ pub async fn handle_get_files(
     payload: Value,
 ) -> Result<GetFilesResponse, ErrorResponse> {
     let ledger = state.parquet_ledger.read().await;
-    let project_id = get_str_param(&payload, "projectId", "project_id")
-        .map(|s| s.to_string())
-        .or_else(|| ledger.active_project_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let project_id = match get_str_param(&payload, "projectId", "project_id") {
+        Some(s) => s.to_string(),
+        None => ledger.get_active_project_id().await,
+    };
 
     let files = ledger.get_project_files(&project_id).await;
 
@@ -203,10 +203,10 @@ pub async fn handle_add_files(
     payload: Value,
 ) -> Result<AddFilesResponse, ErrorResponse> {
     let ledger = state.parquet_ledger.read().await;
-    let project_id = get_str_param(&payload, "projectId", "project_id")
-        .map(|s| s.to_string())
-        .or_else(|| ledger.active_project_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let project_id = match get_str_param(&payload, "projectId", "project_id") {
+        Some(s) => s.to_string(),
+        None => ledger.get_active_project_id().await,
+    };
 
     let file_paths = get_str_vec(&payload, "filePaths", "file_paths");
     if file_paths.is_empty() {
@@ -230,10 +230,10 @@ pub async fn handle_add_folder(
     payload: Value,
 ) -> Result<AddFolderResponse, ErrorResponse> {
     let ledger = state.parquet_ledger.read().await;
-    let project_id = get_str_param(&payload, "projectId", "project_id")
-        .map(|s| s.to_string())
-        .or_else(|| ledger.active_project_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let project_id = match get_str_param(&payload, "projectId", "project_id") {
+        Some(s) => s.to_string(),
+        None => ledger.get_active_project_id().await,
+    };
 
     let folder_path = get_str_param(&payload, "folderPath", "folder_path")
         .ok_or_else(|| ErrorResponse::invalid_argument("Missing folderPath parameter"))?;
@@ -356,10 +356,10 @@ pub async fn handle_get_cache_size(
     payload: Value,
 ) -> Result<CacheSizeResponse, ErrorResponse> {
     let ledger = state.parquet_ledger.read().await;
-    let project_id = get_str_param(&payload, "projectId", "project_id")
-        .map(|s| s.to_string())
-        .or_else(|| ledger.active_project_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let project_id = match get_str_param(&payload, "projectId", "project_id") {
+        Some(s) => s.to_string(),
+        None => ledger.get_active_project_id().await,
+    };
 
     let (file_count, total_bytes, formatted_size) = ledger.get_cache_size(&project_id).await;
 
@@ -378,10 +378,10 @@ pub async fn handle_purge_cache(
     payload: Value,
 ) -> Result<PurgeCacheResponse, ErrorResponse> {
     let ledger = state.parquet_ledger.read().await;
-    let project_id = get_str_param(&payload, "projectId", "project_id")
-        .map(|s| s.to_string())
-        .or_else(|| ledger.active_project_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let project_id = match get_str_param(&payload, "projectId", "project_id") {
+        Some(s) => s.to_string(),
+        None => ledger.get_active_project_id().await,
+    };
 
     let (purged_files, freed_bytes) = ledger
         .purge_cache(&project_id)
@@ -403,10 +403,10 @@ pub async fn handle_remove_file(
     payload: Value,
 ) -> Result<RemoveFileResponse, ErrorResponse> {
     let ledger = state.parquet_ledger.read().await;
-    let project_id = get_str_param(&payload, "projectId", "project_id")
-        .map(|s| s.to_string())
-        .or_else(|| ledger.active_project_id.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let project_id = match get_str_param(&payload, "projectId", "project_id") {
+        Some(s) => s.to_string(),
+        None => ledger.get_active_project_id().await,
+    };
 
     let file_path = get_str_param(&payload, "filePath", "file_path")
         .ok_or_else(|| ErrorResponse::invalid_argument("Missing filePath parameter"))?;

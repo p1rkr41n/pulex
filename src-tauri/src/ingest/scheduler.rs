@@ -19,14 +19,17 @@ use tokio::sync::{Notify, RwLock};
 
 use crate::engine::duckdb_pool::DuckDbEnginePool;
 use crate::engine::fast_count::FastCounter;
-use crate::ingest::csv_streamer::{effective_extension, ingest_csv_file};
-use crate::ingest::dirty_log::ingest_dirty_log;
+use crate::ingest::csv_streamer::{
+    effective_extension, ingest_csv_file_with_options, CsvIngestOptions,
+};
+use crate::ingest::dirty_log::{ingest_dirty_log, ingest_dirty_log_duckdb};
 use crate::ingest::evtx_parser::ingest_evtx_file;
-use crate::ingest::jsonl_streamer::ingest_jsonl_file;
+use crate::ingest::jsonl_streamer::ingest_jsonl_file_with_options;
 use crate::ingest::progress::ProgressDispatcher;
 use crate::ledger::parquet_ledger::{
     build_cache_parquet_name, generate_uuid_v4, normalize_path, LedgerEvent, ParquetLedger,
 };
+use crate::portable::ToadConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum IngestPriority {
@@ -147,6 +150,7 @@ pub struct IngestionScheduler {
     pub dispatcher: Arc<ProgressDispatcher>,
     pub ledger: Option<Arc<RwLock<ParquetLedger>>>,
     pub duckdb_pool: Option<Arc<DuckDbEnginePool>>,
+    pub config: Option<Arc<RwLock<ToadConfig>>>,
     pub temp_dir: PathBuf,
     loop_started: Arc<AtomicBool>,
 }
@@ -194,9 +198,15 @@ impl IngestionScheduler {
             dispatcher,
             ledger,
             duckdb_pool,
+            config: None,
             temp_dir,
             loop_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Attach live shared `ToadConfig` so ingestion workers honor `config.ini` settings dynamically
+    pub fn set_config(&mut self, cfg: Arc<RwLock<ToadConfig>>) {
+        self.config = Some(cfg);
     }
 
     /// Spawns the background dispatcher worker loop if not already running
@@ -593,6 +603,25 @@ impl IngestionScheduler {
         let dst_parquet = PathBuf::from(&job.target_parquet_path);
         let ext = effective_extension(&src_path);
 
+        let active_count = {
+            let st = self.state.read().await;
+            st.active.len().max(1)
+        };
+        let cfg_snapshot = match &self.config {
+            Some(c) => c.read().await.clone(),
+            None => ToadConfig::default(),
+        };
+        let csv_opts = CsvIngestOptions {
+            csv_parallel: cfg_snapshot.duckdb.csv_parallel.clone(),
+            compression: cfg_snapshot.parquet.compression.clone(),
+            row_group_size: cfg_snapshot.parquet.row_group_size,
+        };
+        let evtx_threads = self
+            .duckdb_pool
+            .as_ref()
+            .map(|p| p.resolve_worker_threads(active_count))
+            .unwrap_or(4);
+
         let result: Result<i64, String> = match ext.as_str() {
             "parquet" => {
                 let rows = FastCounter::count_parquet_rows(&src_path).unwrap_or(0);
@@ -612,7 +641,7 @@ impl IngestionScheduler {
                 let src = src_path.clone();
                 let dst = dst_parquet.clone();
                 tokio::task::spawn_blocking(move || {
-                    let res = ingest_evtx_file(&fid, &src, &dst, 4, &ct, Some(&disp))?;
+                    let res = ingest_evtx_file(&fid, &src, &dst, evtx_threads, &ct, Some(&disp))?;
                     Ok(res.row_count)
                 })
                 .await
@@ -626,8 +655,17 @@ impl IngestionScheduler {
                     let ct = cancellation_token.clone();
                     let src = src_path.clone();
                     let dst = dst_parquet.clone();
-                    pool.run_ingest_task(move |conn| {
-                        let res = ingest_csv_file(&fid, &src, &dst, &conn, &ct, Some(&disp))?;
+                    let opts = csv_opts.clone();
+                    pool.run_ingest_task_with_budget(active_count, move |conn| {
+                        let res = ingest_csv_file_with_options(
+                            &fid,
+                            &src,
+                            &dst,
+                            &conn,
+                            &opts,
+                            &ct,
+                            Some(&disp),
+                        )?;
                         Ok(res.row_count)
                     })
                     .await
@@ -653,8 +691,19 @@ impl IngestionScheduler {
                     let ct = cancellation_token.clone();
                     let src = src_path.clone();
                     let dst = dst_parquet.clone();
-                    pool.run_ingest_task(move |conn| {
-                        let res = ingest_jsonl_file(&fid, &src, &dst, &conn, &ct, Some(&disp))?;
+                    let comp = csv_opts.compression.clone();
+                    let rg = csv_opts.row_group_size;
+                    pool.run_ingest_task_with_budget(active_count, move |conn| {
+                        let res = ingest_jsonl_file_with_options(
+                            &fid,
+                            &src,
+                            &dst,
+                            &conn,
+                            &comp,
+                            rg,
+                            &ct,
+                            Some(&disp),
+                        )?;
                         Ok(res.row_count)
                     })
                     .await
@@ -674,19 +723,43 @@ impl IngestionScheduler {
                 }
             }
             _ => {
-                // Fallback to dirty_log for all unknown or arbitrary log extensions
-                let disp = self.dispatcher.clone();
-                let ct = cancellation_token.clone();
-                let src = src_path.clone();
-                let dst = dst_parquet.clone();
-                let fid = job.file_id.clone();
-                tokio::task::spawn_blocking(move || {
-                    let res = ingest_dirty_log(&fid, &src, &dst, &ct, Some(&disp))?;
-                    Ok(res.row_count)
-                })
-                .await
-                .map_err(|e| format!("Join error: {}", e))
-                .and_then(|r| r)
+                // High-speed parallel DuckDB dirty_log when pool is available; Rust line reader fallback
+                if let Some(ref pool) = self.duckdb_pool {
+                    let disp = self.dispatcher.clone();
+                    let ct = cancellation_token.clone();
+                    let src = src_path.clone();
+                    let dst = dst_parquet.clone();
+                    let fid = job.file_id.clone();
+                    let comp = csv_opts.compression.clone();
+                    let rg = csv_opts.row_group_size;
+                    pool.run_ingest_task_with_budget(active_count, move |conn| {
+                        let res = ingest_dirty_log_duckdb(
+                            &fid,
+                            &src,
+                            &dst,
+                            &conn,
+                            &comp,
+                            rg,
+                            &ct,
+                            Some(&disp),
+                        )?;
+                        Ok(res.row_count)
+                    })
+                    .await
+                } else {
+                    let disp = self.dispatcher.clone();
+                    let ct = cancellation_token.clone();
+                    let src = src_path.clone();
+                    let dst = dst_parquet.clone();
+                    let fid = job.file_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let res = ingest_dirty_log(&fid, &src, &dst, &ct, Some(&disp))?;
+                        Ok(res.row_count)
+                    })
+                    .await
+                    .map_err(|e| format!("Join error: {}", e))
+                    .and_then(|r| r)
+                }
             }
         };
 

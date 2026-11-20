@@ -14,6 +14,10 @@ function getBridge(): any {
   }
 }
 
+function isTauriBridge(bridge: any): boolean {
+  return Boolean(bridge && (bridge.engineName === "tauri" || bridge.runtime === "tauri"));
+}
+
 let _reltabDuckDB: any = null;
 function getReltabDuckDB(): any {
   if (!_reltabDuckDB) {
@@ -25,7 +29,7 @@ function getReltabDuckDB(): any {
       if (dynamicRequire) {
         _reltabDuckDB = dynamicRequire("reltab-duckdb");
       }
-    } catch {}
+    } catch { }
   }
   return _reltabDuckDB;
 }
@@ -71,6 +75,7 @@ export class ProjectWorkspaceManager {
   private expandedMap: Map<string, boolean> = new Map();
   private cachedProjects: ProjectWorkspaceProject[] = [];
   private activeProjectId: string = "";
+  private pendingAutoCreate: Promise<string> | null = null;
 
   public getActiveProjectId(): string {
     return this.activeProjectId;
@@ -109,7 +114,7 @@ export class ProjectWorkspaceManager {
     for (const l of this.listeners) {
       try {
         l();
-      } catch {}
+      } catch { }
     }
   }
 
@@ -140,9 +145,14 @@ export class ProjectWorkspaceManager {
       try {
         const res = await bridge.invoke("project:getWorkspace", {});
         if (res && res.projects) {
-          if (res.projects.length === 0 && bridge.runtime !== "tauri") {
+          if (res.projects.length === 0 && !isTauriBridge(bridge)) {
             try {
-              const newId = await this.createProject("Untitled-1");
+              if (!this.pendingAutoCreate) {
+                this.pendingAutoCreate = this.createProject("Untitled-1").finally(() => {
+                  this.pendingAutoCreate = null;
+                });
+              }
+              const newId = await this.pendingAutoCreate;
               const defaultProj: ProjectWorkspaceProject = {
                 projectId: newId,
                 projectName: "Untitled-1",
@@ -154,7 +164,7 @@ export class ProjectWorkspaceManager {
               this.cachedProjects = [defaultProj];
               this.activeProjectId = newId;
               return { projects: [defaultProj], activeProjectId: newId };
-            } catch {}
+            } catch { }
           }
           this.cachedProjects = res.projects;
           this.activeProjectId = res.activeProjectId || (res.projects[0]?.projectId) || "";
@@ -219,7 +229,7 @@ export class ProjectWorkspaceManager {
             folderRoot = ex.folderRoot;
             folderName = ex.folderName;
             relPath = ex.relPath;
-          } catch {}
+          } catch { }
         }
         return {
           filePath: f.source_path,
@@ -249,8 +259,8 @@ export class ProjectWorkspaceManager {
           typeof res === "string"
             ? res
             : res && typeof res === "object"
-            ? res.projectId || res.id || String(res)
-            : String(res);
+              ? res.projectId || res.id || String(res)
+              : String(res);
         this.expandedMap.set(id, true);
         this.activeProjectId = id;
         this.notify();
@@ -281,7 +291,7 @@ export class ProjectWorkspaceManager {
         const res = await bridge.invoke("project:rename", { projectId, newName: newName.trim() });
         this.notify();
         return !!res;
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();
@@ -302,7 +312,7 @@ export class ProjectWorkspaceManager {
           MultipleLoadingManager.getInstance().unregisterFile(f.filePath);
         }
       }
-    } catch {}
+    } catch { }
 
     const bridge = getBridge();
     let result = { deletedFiles: 0, freedBytes: 0 };
@@ -311,7 +321,7 @@ export class ProjectWorkspaceManager {
         result = await bridge.invoke("project:delete", { projectId });
         this.expandedMap.delete(projectId);
         this.notify();
-        if (bridge.runtime === "tauri") {
+        if (isTauriBridge(bridge)) {
           // Rust ParquetLedger handles 500ms debounce auto-recovery and emits project:workspaceChanged
           setTimeout(() => {
             this.notify();
@@ -329,7 +339,7 @@ export class ProjectWorkspaceManager {
           }, 550);
         }
         return result;
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();
@@ -369,7 +379,7 @@ export class ProjectWorkspaceManager {
         this.activeProjectId = "";
         this.notify();
         return result;
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();
@@ -393,7 +403,7 @@ export class ProjectWorkspaceManager {
         const res = await bridge.invoke("project:reconcile", {});
         this.notify();
         return res;
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();
@@ -413,7 +423,7 @@ export class ProjectWorkspaceManager {
     if (bridge && typeof bridge.invoke === "function") {
       try {
         return await bridge.invoke("project:getCacheSize", { projectId });
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();
@@ -430,16 +440,16 @@ export class ProjectWorkspaceManager {
     if (bridge && typeof bridge.invoke === "function") {
       try {
         await bridge.invoke("project:addFiles", { projectId, filePaths });
-        if (bridge.runtime === "tauri") {
+        if (isTauriBridge(bridge)) {
           for (const fp of filePaths) {
             if (fp) {
-              bridge.invoke("toad:ingest_file", { path: fp, projectId }).catch(() => {});
+              bridge.invoke("toad:ingest_file", { filePath: fp, projectId }).catch(() => { });
             }
           }
         }
         this.notify();
         return;
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();
@@ -460,13 +470,13 @@ export class ProjectWorkspaceManager {
         const addedPaths: string[] = Array.isArray(added)
           ? added
           : added && Array.isArray(added.addedFiles)
-          ? added.addedFiles
+            ? added.addedFiles
               .map((f: any) => (typeof f === "string" ? f : f.filePath || f.sourcePath || ""))
               .filter(Boolean)
-          : [];
-        if (bridge.runtime === "tauri") {
+            : [];
+        if (isTauriBridge(bridge)) {
           for (const fp of addedPaths) {
-            bridge.invoke("toad:ingest_file", { path: fp, projectId }).catch(() => {});
+            bridge.invoke("toad:ingest_file", { filePath: fp, projectId }).catch(() => { });
           }
         }
         this.notify();
@@ -495,7 +505,7 @@ export class ProjectWorkspaceManager {
         await bridge.invoke("project:moveOrphanFiles", { targetProjectId: target });
         this.notify();
         return;
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();
@@ -513,7 +523,7 @@ export class ProjectWorkspaceManager {
     if (bridge && typeof bridge.invoke === "function") {
       try {
         await bridge.invoke("project:setActive", { projectId });
-      } catch {}
+      } catch { }
     }
     const duckdb = getReltabDuckDB();
     if (duckdb && duckdb.ToadParquetLedger) {
@@ -531,7 +541,7 @@ export class ProjectWorkspaceManager {
         const res = await bridge.invoke("project:purgeCache", { projectId });
         this.notify();
         return res;
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();
@@ -550,7 +560,7 @@ export class ProjectWorkspaceManager {
   ): Promise<{ freedBytes: number }> {
     try {
       MultipleLoadingManager.getInstance().unregisterFile(filePath);
-    } catch {}
+    } catch { }
 
     const bridge = getBridge();
     if (bridge && typeof bridge.invoke === "function") {
@@ -558,7 +568,7 @@ export class ProjectWorkspaceManager {
         const res = await bridge.invoke("project:removeFile", { projectId, filePath });
         this.notify();
         return res;
-      } catch {}
+      } catch { }
     }
 
     const duckdb = getReltabDuckDB();

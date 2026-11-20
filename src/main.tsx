@@ -12,7 +12,7 @@ try {
       return Number.isSafeInteger(num) ? num : this.toString();
     };
   }
-} catch {}
+} catch { }
 
 // Global Console Interceptor & Lossless Queued Buffer for comprehensive Pulex diagnostics
 interface QueuedLogEntry {
@@ -22,11 +22,11 @@ interface QueuedLogEntry {
   timestamp: number;
 }
 
-const rawConsoleLog = typeof console !== "undefined" ? console.log : () => {};
-const rawConsoleWarn = typeof console !== "undefined" ? console.warn : () => {};
-const rawConsoleError = typeof console !== "undefined" ? console.error : () => {};
-const rawConsoleInfo = typeof console !== "undefined" ? console.info : () => {};
-const rawConsoleDebug = typeof console !== "undefined" ? console.debug : () => {};
+const rawConsoleLog = typeof console !== "undefined" ? console.log : () => { };
+const rawConsoleWarn = typeof console !== "undefined" ? console.warn : () => { };
+const rawConsoleError = typeof console !== "undefined" ? console.error : () => { };
+const rawConsoleInfo = typeof console !== "undefined" ? console.info : () => { };
+const rawConsoleDebug = typeof console !== "undefined" ? console.debug : () => { };
 
 let isForwarding = false;
 let isLoggingReentrant = false;
@@ -44,7 +44,7 @@ function flushLogBuffer() {
     isForwarding = true;
     (window as any).__TAURI__.core
       .invoke("toad:log", { entries: entriesToSend })
-      .catch(() => {})
+      .catch(() => { })
       .finally(() => {
         isForwarding = false;
         if (logBuffer.length > 0) {
@@ -84,7 +84,7 @@ function forwardLogToBackend(level: string, message: string, details?: any) {
         bufferTimer = setTimeout(flushLogBuffer, 50);
       }
     }
-  } catch {}
+  } catch { }
 }
 
 function formatConsoleArgs(args: any[]): { message: string; details?: any } {
@@ -207,6 +207,7 @@ import {
   MultipleLoadingManager,
   ProjectWorkspaceManager,
   PivotRequester,
+  setAutoSortMaxRows,
   AppState,
   ViewParams,
   actions,
@@ -259,12 +260,15 @@ async function bootstrap() {
   const [App] = refContainer<AppState, AppPaneBaseProps>(stateRef, AppPane);
 
   try {
-    await bridge.invoke("toad:init_main").catch(() => {});
+    await bridge.invoke("toad:init_main").catch(() => { });
     try {
       const cfg = await bridge.getConfig();
       if (cfg && cfg.general) {
         if (cfg.general.page_size) {
           actions.setDefaultPageSize(Number(cfg.general.page_size));
+        }
+        if (typeof cfg.general.auto_sort_max_rows === "number") {
+          setAutoSortMaxRows(cfg.general.auto_sort_max_rows);
         }
         MultipleLoadingManager.getInstance().setConfig({
           maxConcurrentFiles: cfg.general.max_concurrent_files,
@@ -279,8 +283,8 @@ async function bootstrap() {
     await initAppState(rtc, stateRef);
     const _pivotRequester = new PivotRequester(stateRef);
 
-    const openURL = (url: string) => {
-      bridge.openExternal(url);
+    const openURL = (_url: string) => {
+      // Plain-text URL safe mode: never launch external browser from grid cell clicks
     };
 
     const appClipboard = {
@@ -336,7 +340,7 @@ async function bootstrap() {
               path: [String(children[0].id)],
             };
           }
-        } catch {}
+        } catch { }
       }
       await actions.openDataSourcePath(dsPath, stateRef, savedViewParams);
     };
@@ -357,10 +361,12 @@ async function bootstrap() {
         }> = [];
         try {
           const statRes: any = await bridge.invoke("toad:stat_path", { paths: cleaned });
-          if (statRes && Array.isArray(statRes.entries)) {
+          if (Array.isArray(statRes)) {
+            statEntries = statRes;
+          } else if (statRes && Array.isArray(statRes.entries)) {
             statEntries = statRes.entries;
           }
-        } catch {}
+        } catch { }
 
         const directories: string[] = [];
         const workspaceFiles: string[] = [];
@@ -402,7 +408,7 @@ async function bootstrap() {
             if (typeof wsPayload?.contents === "string") {
               try {
                 wsPayload = JSON.parse(wsPayload.contents);
-              } catch {}
+              } catch { }
             }
             if (wsPayload?.activeProjectId) {
               await ProjectWorkspaceManager.getInstance().setActiveProject(
@@ -414,7 +420,7 @@ async function bootstrap() {
             if (rawVP) {
               try {
                 restoredVP = ViewParams.deserialize(rawVP);
-              } catch {}
+              } catch { }
             }
             const restoredDsPath = wsPayload?.dsPath || wsPayload?.contents?.dsPath;
             if (restoredDsPath) {
@@ -511,14 +517,14 @@ async function bootstrap() {
               bridge.onEvent("tauri://drag-drop", (payload: any) => {
                 onDropPayload(payload);
               });
-            } catch {}
+            } catch { }
           });
       } else {
         try {
           bridge.onEvent("tauri://drag-drop", (payload: any) => {
             onDropPayload(payload);
           });
-        } catch {}
+        } catch { }
       }
     }
 
@@ -529,8 +535,8 @@ async function bootstrap() {
       const rawArgs: string[] = Array.isArray(payload?.args)
         ? payload.args.slice(1)
         : Array.isArray(payload)
-        ? payload.slice(1)
-        : [];
+          ? payload.slice(1)
+          : [];
       if (rawArgs.length > 0) {
         ingestAndOpenPaths(rawArgs);
       }
@@ -547,10 +553,15 @@ async function bootstrap() {
           }
         }
         const startupRes: any = await bridge.invoke("toad:get_startup_args", {});
-        if (startupRes && Array.isArray(startupRes.files) && startupRes.files.length > 0) {
-          await ingestAndOpenPaths(startupRes.files);
+        const startupPaths: string[] = Array.isArray(startupRes?.files)
+          ? startupRes.files
+          : Array.isArray(startupRes?.args)
+            ? startupRes.args.filter((a: any) => typeof a === "string" && !a.startsWith("-"))
+            : [];
+        if (startupPaths.length > 0) {
+          await ingestAndOpenPaths(startupPaths);
         }
-      } catch {}
+      } catch { }
     })();
 
     // =========================================================================
@@ -580,8 +591,8 @@ async function bootstrap() {
             const folderPath = Array.isArray(chosen)
               ? chosen[0]
               : typeof chosen === "string"
-              ? chosen
-              : null;
+                ? chosen
+                : null;
             if (folderPath) {
               await ingestAndOpenPaths([folderPath]);
             }

@@ -56,9 +56,10 @@ impl AppState {
         let config_path = portable_dir.join("config.ini");
         let temp_dir = portable_dir.join("temp");
         let _ = std::fs::create_dir_all(&temp_dir);
-        let pool = DuckDbEnginePool::new(
+        let pool = DuckDbEnginePool::new_with_background_threads(
             temp_dir.clone(),
             config.duckdb.threads,
+            config.duckdb.background_threads.clone(),
             config.duckdb.max_memory.clone(),
         )
         .ok()
@@ -83,8 +84,9 @@ impl AppState {
             }
         };
 
+        let config_arc = Arc::new(RwLock::new(config.clone()));
         let ledger_arc = Arc::new(RwLock::new(ledger));
-        let scheduler = IngestionScheduler::new(
+        let mut scheduler = IngestionScheduler::new(
             temp_dir,
             Some(ledger_arc.clone()),
             pool,
@@ -92,6 +94,7 @@ impl AppState {
             config.general.max_concurrent_files as usize,
             (config.general.max_concurrent_gb * 1_073_741_824.0) as u64,
         );
+        scheduler.set_config(config_arc.clone());
 
         let derived_path = portable_dir.join("derived_views.json");
         let initial_derived: std::collections::HashMap<String, DerivedViewSpec> =
@@ -107,7 +110,7 @@ impl AppState {
         Self {
             portable_dir,
             config_path,
-            config: Arc::new(RwLock::new(config)),
+            config: config_arc,
             duckdb_engine: Arc::new(RwLock::new(placeholder)),
             parquet_ledger: ledger_arc,
             ingest_queue: Arc::new(RwLock::new(scheduler)),

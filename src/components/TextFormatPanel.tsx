@@ -7,29 +7,14 @@ export interface TextFormatPanelProps {
   onChange?: (opts: TextFormatOptions) => void;
 }
 
-export const TextFormatPanel: React.FC<TextFormatPanelProps> = ({
-  opts,
-  onChange,
-}) => {
-  const handleRenderHyperlinksChange = (event: any) => {
-    const checkVal = event.target.checked;
-    const nextOpts = opts.set(
-      "urlsAsHyperlinks",
-      checkVal
-    ) as TextFormatOptions;
-
-    if (onChange) {
-      onChange(nextOpts);
-    }
-  };
-
+export const TextFormatPanel: React.FC<TextFormatPanelProps> = () => {
   return (
     <div className="format-subpanel">
       <Checkbox
         className="bp4-condensed"
-        checked={opts.urlsAsHyperlinks}
-        onChange={(event) => handleRenderHyperlinksChange(event)}
-        label="Render URLs as Hyperlinks"
+        checked={false}
+        disabled={true}
+        label="Render URLs as Hyperlinks (Disabled — Plain-Text Safe Mode)"
       />
     </div>
   );

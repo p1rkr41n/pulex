@@ -19,6 +19,18 @@ import { ViewState } from "./ViewState";
 import { Timer, TimerUpdater } from "./Timer";
 import _ from "lodash";
 
+// Configurable maximum row count eligible for automatic `ORDER BY timeCol DESC` on open.
+// Default: 500,000 rows (0 = disabled, -1 = always enabled). Prevents 15-25s full-table sort stalls on 40GB datasets.
+let autoSortMaxRowsThreshold: number = 500_000;
+
+export const setAutoSortMaxRows = (maxRows: number): void => {
+  if (typeof maxRows === "number" && Number.isFinite(maxRows)) {
+    autoSortMaxRowsThreshold = Math.trunc(maxRows);
+  }
+};
+
+export const getAutoSortMaxRows = (): number => autoSortMaxRowsThreshold;
+
 // Error dialogs are handled via IHostBridge.showErrorDialog()
 /**
  * Use ViewParams to construct a PagedDataView for use with
@@ -220,11 +232,20 @@ const requestQueryView = async (
 
   const effectiveFilterExp = viewParams.filterExp;
 
+  onViewRowCount?.(baseQuery, "unfiltered");
+  const baseRowCount = await rt.rowCount(baseQuery);
+  onViewRowCountResolved?.(baseQuery, baseRowCount, "unfiltered");
+
   let effectiveSortKey = viewParams.sortKey;
   if (!effectiveSortKey || effectiveSortKey.length === 0) {
-    const timeCol = findBestTimeColumn(baseSchema);
-    if (timeCol) {
-      effectiveSortKey = [[timeCol, false]]; // DESC sort for deterministic ordering
+    const allowAutoSort =
+      autoSortMaxRowsThreshold < 0 ||
+      (autoSortMaxRowsThreshold > 0 && baseRowCount <= autoSortMaxRowsThreshold);
+    if (allowAutoSort) {
+      const timeCol = findBestTimeColumn(baseSchema);
+      if (timeCol) {
+        effectiveSortKey = [[timeCol, false]]; // DESC sort for deterministic ordering
+      }
     }
   }
 
@@ -242,9 +263,6 @@ const requestQueryView = async (
   );
   const treeQuery = await ptree.getSortedTreeQuery(viewParams.openPaths); // const t0 = performance.now()  // eslint-disable-line
 
-  onViewRowCount?.(baseQuery, "unfiltered");
-  const baseRowCount = await rt.rowCount(baseQuery);
-  onViewRowCountResolved?.(baseQuery, baseRowCount, "unfiltered");
   const filterRowCount = await fastFilterRowCount(
     rt,
     baseRowCount,

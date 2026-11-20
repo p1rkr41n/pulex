@@ -156,12 +156,12 @@ export const FileTreeItemLabel: React.FC<{
         <span className="file-hover-label">Status:</span>
         <span
           className={`file-hover-val ${isReady
-              ? "text-success"
-              : isModified
-                ? "text-danger"
-                : isProcessing
-                  ? "text-primary"
-                  : ""
+            ? "text-success"
+            : isModified
+              ? "text-danger"
+              : isProcessing
+                ? "text-primary"
+                : ""
             }`}
         >
           {isProcessing
@@ -192,16 +192,16 @@ export const FileTreeItemLabel: React.FC<{
       <div className="file-node-row">
         <span
           className={`file-node-title ds-file-node-title ${isReady
-              ? "status-ready ds-status-ready"
-              : isModified
-                ? "status-modified ds-status-modified"
-                : isProcessing
-                  ? "status-processing ds-status-processing"
-                  : isError
-                    ? "status-error ds-status-error"
-                    : isPending
-                      ? "status-pending ds-status-pending"
-                      : "status-idle ds-status-idle"
+            ? "status-ready ds-status-ready"
+            : isModified
+              ? "status-modified ds-status-modified"
+              : isProcessing
+                ? "status-processing ds-status-processing"
+                : isError
+                  ? "status-error ds-status-error"
+                  : isPending
+                    ? "status-pending ds-status-pending"
+                    : "status-idle ds-status-idle"
             }`}
           title={statusTitle}
         >
@@ -452,7 +452,7 @@ export const DataSourceSidebar: React.FC<DataSourceSidebarProps> = ({
   const pwManager = ProjectWorkspaceManager.getInstance();
   const [projects, setProjects] = useState<ProjectWorkspaceProject[]>([]);
   const [projectFilesMap, setProjectFilesMap] = useState<Map<string, ProjectWorkspaceFile[]>>(new Map());
-  const [activeProjectId, setActiveProjectId] = useState<string>("prj_untitled_1");
+  const [activeProjectId, setActiveProjectId] = useState<string>("");
   const [searchQuery, setSearchQuery] = useState("");
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
@@ -496,7 +496,7 @@ export const DataSourceSidebar: React.FC<DataSourceSidebarProps> = ({
   const refreshWorkspaceData = async () => {
     try {
       const ws = await pwManager.getWorkspace();
-      setActiveProjectId(ws.activeProjectId || "prj_untitled_1");
+      setActiveProjectId(ws.activeProjectId || ws.projects[0]?.projectId || "");
       const newFilesMap = new Map<string, ProjectWorkspaceFile[]>();
       const fileItemsForMLM: any[] = [];
       const curAppState = mutableGet(stateRef);
@@ -794,7 +794,6 @@ export const DataSourceSidebar: React.FC<DataSourceSidebarProps> = ({
       }
       await pwManager.deleteAllProjects();
       setDeleteAllOpen(false);
-      refreshWorkspaceData();
     } catch (err) {
       console.error("Error deleting all projects:", err);
     }
@@ -876,7 +875,7 @@ export const DataSourceSidebar: React.FC<DataSourceSidebarProps> = ({
           </div>
         ) : (
           filteredProjects.map(({ project, files, isExpanded }) => {
-            const isActive = project.projectId === (activeProjectId || "prj_untitled_1");
+            const isActive = project.projectId === (activeProjectId || projects[0]?.projectId || "");
             return (
               <div
                 key={project.projectId}
@@ -919,8 +918,19 @@ export const DataSourceSidebar: React.FC<DataSourceSidebarProps> = ({
                           multiple: true,
                         });
                         if (chosen && chosen.length > 0) {
+                          pwManager.setProjectExpanded(project.projectId, true);
+                          await pwManager.setActiveProject(project.projectId);
                           await pwManager.addFilesToProject(project.projectId, chosen);
-                          refreshWorkspaceData();
+                          await refreshWorkspaceData();
+                          if (!mutableGet(stateRef).viewState && chosen[0]) {
+                            await actions.openDataSourcePath(
+                              {
+                                sourceId: { providerName: "localfs", resourceId: chosen[0] },
+                                path: ["."],
+                              },
+                              stateRef
+                            );
+                          }
                         }
                       } catch (err) {
                         console.error("Error adding files:", err);
@@ -936,8 +946,19 @@ export const DataSourceSidebar: React.FC<DataSourceSidebarProps> = ({
                         });
                         const folderPath = Array.isArray(chosen) ? chosen[0] : (typeof chosen === "string" ? chosen : null);
                         if (folderPath) {
-                          await pwManager.addFolderToProject(project.projectId, folderPath);
-                          refreshWorkspaceData();
+                          pwManager.setProjectExpanded(project.projectId, true);
+                          await pwManager.setActiveProject(project.projectId);
+                          const addedPaths = await pwManager.addFolderToProject(project.projectId, folderPath);
+                          await refreshWorkspaceData();
+                          if (!mutableGet(stateRef).viewState && addedPaths && addedPaths.length > 0) {
+                            await actions.openDataSourcePath(
+                              {
+                                sourceId: { providerName: "localfs", resourceId: addedPaths[0] },
+                                path: ["."],
+                              },
+                              stateRef
+                            );
+                          }
                         }
                       } catch (err) {
                         console.error("Error adding folder:", err);
@@ -1014,8 +1035,19 @@ export const DataSourceSidebar: React.FC<DataSourceSidebarProps> = ({
                         multiple: true,
                       });
                       if (chosen && chosen.length > 0) {
+                        pwManager.setProjectExpanded(proj.projectId, true);
+                        await pwManager.setActiveProject(proj.projectId);
                         await pwManager.addFilesToProject(proj.projectId, chosen);
-                        refreshWorkspaceData();
+                        await refreshWorkspaceData();
+                        if (!mutableGet(stateRef).viewState && chosen[0]) {
+                          await actions.openDataSourcePath(
+                            {
+                              sourceId: { providerName: "localfs", resourceId: chosen[0] },
+                              path: ["."],
+                            },
+                            stateRef
+                          );
+                        }
                       }
                     } catch (err) {
                       console.error("Error adding files:", err);
@@ -1036,8 +1068,19 @@ export const DataSourceSidebar: React.FC<DataSourceSidebarProps> = ({
                       });
                       const folderPath = Array.isArray(chosen) ? chosen[0] : (typeof chosen === "string" ? chosen : null);
                       if (folderPath) {
-                        await pwManager.addFolderToProject(proj.projectId, folderPath);
-                        refreshWorkspaceData();
+                        pwManager.setProjectExpanded(proj.projectId, true);
+                        await pwManager.setActiveProject(proj.projectId);
+                        const addedPaths = await pwManager.addFolderToProject(proj.projectId, folderPath);
+                        await refreshWorkspaceData();
+                        if (!mutableGet(stateRef).viewState && addedPaths && addedPaths.length > 0) {
+                          await actions.openDataSourcePath(
+                            {
+                              sourceId: { providerName: "localfs", resourceId: addedPaths[0] },
+                              path: ["."],
+                            },
+                            stateRef
+                          );
+                        }
                       }
                     } catch (err) {
                       console.error("Error adding folder:", err);

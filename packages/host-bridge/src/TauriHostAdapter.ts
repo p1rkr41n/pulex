@@ -182,6 +182,7 @@ export class TauriHostAdapter implements IHostBridge {
           page_size: 1000,
           max_concurrent_files: 4,
           max_concurrent_gb: 1.0,
+          auto_sort_max_rows: 500000,
         },
         runtime: {
           engine: "tauri",
@@ -191,6 +192,7 @@ export class TauriHostAdapter implements IHostBridge {
           max_memory: "auto",
           threads: 0,
           background_threads: "auto",
+          csv_parallel: "auto",
           add_raw_event: false,
         },
         parquet: {

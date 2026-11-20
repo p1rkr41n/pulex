@@ -1562,7 +1562,7 @@ export const RegexDialog: React.FC<RegexDialogProps> = ({
               Parse Columns
             </h4>
             <span style={{ fontSize: "10px", fontWeight: 600, color: "var(--md-sys-color-primary, #0369a1)", background: "rgba(138, 180, 248, 0.12)", border: "1px solid rgba(138, 180, 248, 0.28)", padding: "1px 6px", borderRadius: "10px" }}>
-              v3.0.1
+              v3.0.2
             </span>
           </div>
           {/* Linear-style Capsule Segmented Switch */}
@@ -2639,7 +2639,7 @@ export const RegexDialog: React.FC<RegexDialogProps> = ({
 
             <div style={{ maxHeight: "200px", overflowY: "auto", border: "1px solid var(--md-sys-color-outline-variant, #d8e1e8)", borderRadius: "6px", background: "var(--md-sys-color-surface-container-low, #ffffff)" }}>
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12px" }}>
-                <thead>
+                <thead style={{ position: "sticky", top: 0, zIndex: 2, background: "var(--md-sys-color-surface-container, #ebf1f5)" }}>
                   <tr style={{ background: "var(--md-sys-color-surface-container, #ebf1f5)", borderBottom: "1px solid var(--md-sys-color-outline-variant, #d8e1e8)" }}>
                     <th style={{ width: "30px", padding: "6px 8px" }}>
                       <input

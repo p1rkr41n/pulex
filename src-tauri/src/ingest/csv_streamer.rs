@@ -9,7 +9,7 @@
 //! - Graceful fallback to `dirty_log` if malformed or unstructured.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -171,6 +171,56 @@ pub fn sniff_delimiter(file_path: &Path) -> char {
     sniff_delimiter_from_reader(BufReader::new(file), extension_hint)
 }
 
+/// Estimate column count from the first non-empty header line (supports plain UTF-8 and `.gz`).
+fn estimate_header_column_count(file_path: &Path, delim: char) -> usize {
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let delim_idx = CANDIDATE_DELIMITERS
+        .iter()
+        .position(|&c| c == delim)
+        .unwrap_or(0);
+    let read_first_count = |mut reader: Box<dyn BufRead>| -> usize {
+        let mut line = String::new();
+        for _ in 0..5 {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if !line.trim().is_empty() => {
+                    return count_delimiters_in_line(&line)[delim_idx] + 1;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        0
+    };
+    if file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map_or(false, |e| e.eq_ignore_ascii_case("gz"))
+    {
+        read_first_count(Box::new(BufReader::new(MultiGzDecoder::new(file))))
+    } else {
+        read_first_count(Box::new(BufReader::new(file)))
+    }
+}
+
+/// Inspect the first 2 decompressed bytes of a `.gz` stream to determine whether inner text is UTF-16.
+fn is_gzip_inner_utf16(source_path: &Path) -> bool {
+    let file = match File::open(source_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut decoder = MultiGzDecoder::new(file);
+    let mut hdr = [0u8; 2];
+    match decoder.read(&mut hdr) {
+        Ok(n) if n >= 2 => (hdr[0] == 0xFF && hdr[1] == 0xFE) || (hdr[0] == 0xFE && hdr[1] == 0xFF),
+        _ => false,
+    }
+}
+
 fn count_delimiters_in_line(line: &str) -> [usize; 4] {
     let mut counts = [0usize; 4];
     let mut in_quotes = false;
@@ -305,11 +355,22 @@ pub fn ingest_csv_file_with_options(
     }
 
     let compression_sql = sanitize_parquet_compression(&opts.compression);
-    let rg_size = if opts.row_group_size >= 1000 {
+    let est_cols = estimate_header_column_count(&working_source, delim);
+    let base_rg_size = if opts.row_group_size >= 1000 {
         opts.row_group_size
     } else {
         25_000
     };
+    // Adapt Parquet row group size and sniffer sample size for ultra-wide CSVs (>200 / >1000 cols)
+    // to prevent worker memory spikes during COPY while maintaining high throughput.
+    let rg_size = if est_cols > 1000 {
+        base_rg_size.min(5_000)
+    } else if est_cols > 200 {
+        base_rg_size.min(10_000)
+    } else {
+        base_rg_size
+    };
+    let sample_size: usize = if est_cols > 200 { 20_480 } else { 100_000 };
     let gzip_clause = if is_native_gzip {
         ", compression = 'gzip'"
     } else {
@@ -324,11 +385,12 @@ pub fn ingest_csv_file_with_options(
         disp.spawn_copy_progress_ticker(file_id, source_path, &working_source, &temp_out, 0.22)
     });
 
-    // Tier 0: Parallel-first auto_detect with all_varchar guard and config-driven Parquet output
+    // Tier 0: Parallel-first RFC-4180 auto_detect with all_varchar guard and config-driven Parquet output
     let tier0_sql = format!(
-        "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = 100000, ignore_errors = true, null_padding = true, all_varchar = true, parallel = {par}{gz})) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
+        "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = {sample}, ignore_errors = true, null_padding = true, all_varchar = true, parallel = {par}{gz})) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
         src = safe_src,
         delim = delim_str,
+        sample = sample_size,
         par = try_parallel,
         gz = gzip_clause,
         dst = safe_dst,
@@ -339,18 +401,19 @@ pub fn ingest_csv_file_with_options(
     let mut tier_used = 0u8;
     let mut exec_result = conn.execute_batch(&tier0_sql);
 
-    // Tier 1: Safe serial fallback (parallel=false, header=true, quote='') when Tier 0 fails
+    // Tier 1: Serial RFC-4180 quoted mode (preserves auto-detected quotes & handles quoted newlines + null_padding)
     if exec_result.is_err() && allow_serial_fallback && !cancellation_token.is_cancelled() {
         tracing::warn!(
-            "CSV Tier 0 (parallel={}) failed ({:?}); attempting Tier 1 safe serial quote/header mode",
+            "CSV Tier 0 (parallel={}) failed ({:?}); attempting Tier 1 serial RFC-4180 quoted mode",
             try_parallel,
             exec_result.as_ref().err()
         );
         let _ = std::fs::remove_file(&temp_out);
         let tier1_sql = format!(
-            "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = 100000, header = true, quote = '', ignore_errors = true, null_padding = true, all_varchar = true, parallel = false{gz})) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
+            "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = {sample}, ignore_errors = true, null_padding = true, all_varchar = true, parallel = false{gz})) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
             src = safe_src,
             delim = delim_str,
+            sample = sample_size,
             gz = gzip_clause,
             dst = safe_dst,
             comp = compression_sql,
@@ -360,6 +423,27 @@ pub fn ingest_csv_file_with_options(
         exec_result = conn.execute_batch(&tier1_sql);
     }
 
+    // Tier 2: Loose serial unquoted fallback (quote='', strict_mode=false) for malformed unquoted logs
+    if exec_result.is_err() && allow_serial_fallback && !cancellation_token.is_cancelled() {
+        tracing::warn!(
+            "CSV Tier 1 (serial RFC-4180) failed ({:?}); attempting Tier 2 loose unquoted serial mode",
+            exec_result.as_ref().err()
+        );
+        let _ = std::fs::remove_file(&temp_out);
+        let tier2_sql = format!(
+            "COPY (SELECT * FROM read_csv('{src}', delim = '{delim}', auto_detect = true, sample_size = {sample}, header = true, quote = '', strict_mode = false, ignore_errors = true, null_padding = true, all_varchar = true, parallel = false{gz})) TO '{dst}' (FORMAT PARQUET, COMPRESSION {comp}, ROW_GROUP_SIZE {rg});",
+            src = safe_src,
+            delim = delim_str,
+            sample = sample_size,
+            gz = gzip_clause,
+            dst = safe_dst,
+            comp = compression_sql,
+            rg = rg_size
+        );
+        tier_used = 2;
+        exec_result = conn.execute_batch(&tier2_sql);
+    }
+
     drop(_progress_ticker);
 
     if cancellation_token.is_cancelled() {
@@ -367,11 +451,11 @@ pub fn ingest_csv_file_with_options(
         return Err("Ingestion cancelled by user".to_string());
     }
 
-    // Tier 2: Dirty log fallback if both Tier 0 and Tier 1 fail
+    // Tier 3: Dirty log fallback if Tiers 0, 1, and 2 all fail
     if exec_result.is_err() {
-        tracing::warn!("CSV Tier 1 failed; falling back to Tier 2 (dirty_log)");
+        tracing::warn!("CSV Tier 2 failed ({:?}); falling back to Tier 3 (dirty_log)", exec_result.as_ref().err());
         let _ = std::fs::remove_file(&temp_out);
-        tier_used = 2;
+        tier_used = 3;
         let dirty_res = ingest_dirty_log(
             file_id,
             &working_source,
@@ -499,6 +583,54 @@ mod tests {
             !dst_pq.with_extension("utf8_tmp.csv").exists(),
             "Native gzip CSV must not create intermediate utf8_tmp.csv file"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_csv_quoted_newlines_with_null_padding_uses_serial_rfc4180_tier1() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "pulex_quoted_newline_csv_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+
+        let src = tmp_dir.join("summary_quoted.csv");
+        let dst = tmp_dir.join("summary_quoted.parquet");
+
+        // UTF-8 BOM + quoted XML fields containing embedded CRLF newlines and commas
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(
+            b"__lp_rule,__lp_record_id,raw_log,parse_status\r\n\
+              native__evtx,r1,\"<Event>\r\n  <Data>hello, world</Data>\r\n</Event>\",parsed\r\n\
+              native__evtx,r2,\"<Event>\r\n  <Data>second, line</Data>\r\n</Event>\",parsed\r\n",
+        );
+        std::fs::write(&src, &bytes).expect("write quoted newline csv");
+
+        let conn = Connection::open_in_memory().expect("open duckdb");
+        let ct = CancellationToken::new();
+        let res = ingest_csv_file("f_qn", &src, &dst, &conn, &ct, None)
+            .expect("quoted-newline CSV must ingest cleanly without falling back to raw_event");
+        assert_eq!(res.row_count, 2);
+        assert!(
+            res.tier_used <= 1,
+            "Must succeed on Tier 0 or Tier 1 RFC-4180, got tier {}",
+            res.tier_used
+        );
+
+        let safe_dst = dst.to_string_lossy().replace('\\', "/").replace('\'', "''");
+        let col_count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM (DESCRIBE SELECT * FROM read_parquet('{}'))",
+                    safe_dst
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("count cols");
+        assert_eq!(col_count, 4, "All 4 CSV columns must be preserved");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

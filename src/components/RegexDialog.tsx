@@ -1281,6 +1281,11 @@ export const RegexDialog: React.FC<RegexDialogProps> = ({
             kvAssign,
             quoteOpen,
             quoteClose,
+            firstRowIsHeader,
+            firstRowHeaderPrefix:
+              formatType === "csv" && firstRowIsHeader && sampleList && sampleList.length > 0
+                ? sampleList[0].slice(0, 64)
+                : undefined,
             fieldMappings: activeMappings,
           },
           stateRef
@@ -1562,7 +1567,7 @@ export const RegexDialog: React.FC<RegexDialogProps> = ({
               Parse Columns
             </h4>
             <span style={{ fontSize: "10px", fontWeight: 600, color: "var(--md-sys-color-primary, #0369a1)", background: "rgba(138, 180, 248, 0.12)", border: "1px solid rgba(138, 180, 248, 0.28)", padding: "1px 6px", borderRadius: "10px" }}>
-              v3.0.2
+              v3.0.3
             </span>
           </div>
           {/* Linear-style Capsule Segmented Switch */}

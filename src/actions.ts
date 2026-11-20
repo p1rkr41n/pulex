@@ -1201,6 +1201,8 @@ export interface ColumnExtractionParams {
   quoteClose?: string;
   trim?: boolean;
   collapseDelimiters?: boolean;
+  firstRowIsHeader?: boolean;
+  firstRowHeaderPrefix?: string;
   regexPattern?: string;
   fieldMappings: ExtractionFieldMapping[];
 }
@@ -1227,13 +1229,20 @@ export const applyColumnExtraction = async (
     throw new Error("Please select at least one column to extract!");
   }
 
-  // 1. Determine current table name
+  // 1. Determine current table name (always ensure a materialized DuckDB view, never a bare filename)
   let currentTableName: string;
   const baseRep = (viewState.baseQuery as any)?._rep;
-  if (baseRep && baseRep.operator === "table" && baseRep.tableName) {
-    currentTableName = baseRep.tableName;
+  const candidateTableName =
+    baseRep && baseRep.operator === "table" && typeof baseRep.tableName === "string"
+      ? baseRep.tableName
+      : "";
+  const isMaterializedView = /^(tbl_[0-9a-f]+|main_table)(_rx\d+)?$/i.test(candidateTableName);
+  if (candidateTableName && isMaterializedView) {
+    currentTableName = candidateTableName;
   } else if (dsPath) {
     currentTableName = await dbc.getTableName(dsPath);
+  } else if (candidateTableName) {
+    currentTableName = candidateTableName;
   } else {
     throw new Error("Cannot determine current table name for column extraction");
   }
@@ -1271,6 +1280,22 @@ export const applyColumnExtraction = async (
   } else {
     targetColForExtract = rawTargetColEscaped;
     fromSourceClause = `FROM "${currentTableName}"`;
+  }
+
+  // Exclude header row when Parse Columns -> CSV has "First row is header" enabled
+  if (
+    params.mode === "simple" &&
+    params.formatType === "csv" &&
+    params.firstRowIsHeader &&
+    params.firstRowHeaderPrefix &&
+    params.firstRowHeaderPrefix.length > 0
+  ) {
+    const escapedPrefix = params.firstRowHeaderPrefix
+      .slice(0, 64)
+      .replace(/'/g, "''")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_");
+    fromSourceClause += ` WHERE ${rawTargetColEscaped} NOT LIKE '${escapedPrefix}%' ESCAPE '\\'`;
   }
 
   // 4. Collect new column names and handle collisions with existing columns
@@ -1401,14 +1426,23 @@ export const applyColumnExtraction = async (
       }
     } else if (formatType === "csv") {
       const delim = params.delimiter || ",";
+      const sqlDelim = delim.replace(/'/g, "''");
       const regexDelim = delim.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
+      // DuckDB RE2 hard-caps repetition quantifiers at {1000}; use native list_extract(str_split(...))
+      // for wide CSV extractions (>100 cols or idx > 900) for O(N) performance and unlimited columns.
+      const useFastSplit = activeMappings.length > 100;
       for (const m of activeMappings) {
         const idx = m.tokenIndex !== undefined ? m.tokenIndex : Math.max(1, Number(String(m.sourceKeyOrIdx).replace(/^str_?/i, "")) || 1);
         const repCount = idx - 1;
         const outCol = `"${m.outputColName.trim().replace(/"/g, '""')}"`;
-        const pattern = `^(?:(?:"[^"]*"|[^${regexDelim}]*)${regexDelim}){${repCount}}(?:"([^"]*)"|([^${regexDelim}]*))`;
-        const sqlPattern = pattern.replace(/'/g, "''");
-        let expr = `COALESCE(NULLIF(regexp_extract(${targetColForExtract}, '${sqlPattern}', 1), ''), regexp_extract(${targetColForExtract}, '${sqlPattern}', 2))`;
+        let expr: string;
+        if (useFastSplit || repCount >= 900) {
+          expr = `TRIM(list_extract(str_split(${targetColForExtract}, '${sqlDelim}'), ${idx}), '"')`;
+        } else {
+          const pattern = `^(?:(?:"[^"]*"|[^${regexDelim}]*)${regexDelim}){${repCount}}(?:"([^"]*)"|([^${regexDelim}]*))`;
+          const sqlPattern = pattern.replace(/'/g, "''");
+          expr = `COALESCE(NULLIF(regexp_extract(${targetColForExtract}, '${sqlPattern}', 1), ''), regexp_extract(${targetColForExtract}, '${sqlPattern}', 2))`;
+        }
         if (params.trim !== false) {
           expr = `TRIM(${expr})`;
         }

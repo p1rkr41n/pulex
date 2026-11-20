@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Dedicated Production Packaging Script for Pulex v3.0.0 (Tauri v2 Edition)
     Standard: HelloKittyXamKinLung Indie Release Pipeline
@@ -15,7 +15,7 @@
 
 param (
     [string]$AppName = "Pulex",
-    [string]$Version = "3.0.2",
+    [string]$Version = "3.0.3",
     [string]$Publisher = "HelloKittyXamKinLung",
     [switch]$SkipFrontendBuild = $false,
     [switch]$SkipBackendBuild = $false

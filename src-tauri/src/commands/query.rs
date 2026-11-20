@@ -363,6 +363,12 @@ pub async fn handle_get_table_name(
     }
 
     // 3. Locate existing Parquet cache across temp_dir and project subdirectories
+    let force_reopen = payload
+        .get("forceReopen")
+        .or_else(|| payload.get("force_reopen"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let mut cached_parquet_path: Option<PathBuf> = None;
     if temp_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
@@ -371,12 +377,20 @@ pub async fn handle_get_table_name(
                 if p.is_dir() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with(".trash") {
                     let candidate = p.join(&cache_name);
                     if candidate.exists() && candidate.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                        cached_parquet_path = Some(candidate);
+                        if force_reopen {
+                            let _ = std::fs::remove_file(&candidate);
+                        } else {
+                            cached_parquet_path = Some(candidate);
+                        }
                         break;
                     }
                 } else if p.is_file() && p.file_name().map(|n| n == cache_name.as_str()).unwrap_or(false) {
                     if p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                        cached_parquet_path = Some(p);
+                        if force_reopen {
+                            let _ = std::fs::remove_file(&p);
+                        } else {
+                            cached_parquet_path = Some(p);
+                        }
                         break;
                     }
                 }

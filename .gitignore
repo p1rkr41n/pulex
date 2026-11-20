@@ -1,0 +1,88 @@
+# Rust build artifacts
+target/
+src-tauri/target/
+*.pdb
+
+# Node & package artifacts
+node_modules/
+dist/
+release/
+releases/*.exe
+releases/*.zip
+*.exe
+*.dll
+
+# Portable toolchains
+node-v18.20.4-win-x64/
+tools/node22/
+mingit/
+tools/jj/
+data_sample/
+
+# AppData, runtime state & logs
+pulexAppData/
+pulexAppData_*/
+toadAppData/
+toadAppData_*/
+derived_views.json
+config.ini
+examples/
+*.log
+__pycache__/
+*.pyc
+
+# Secrets, keys & environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.kdbx
+*credentials*
+*secret*
+*.token
+
+# Local datasets, workspaces & temp artifacts
+*.pulex
+*.toad
+*.tad
+*.evtx
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite3
+*.db
+*.arrow
+*.tmp
+*.bak
+*.swp
+*.swo
+scratch/
+tmp/
+temp/
+.cache/
+
+# AI agent rules, skills, instructions & caches
+.agents/
+.gemini/
+.claude/
+.cursor/
+.codex/
+.windsurf/
+.copilot/
+.aider*
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursorrules
+.mcp.json
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+

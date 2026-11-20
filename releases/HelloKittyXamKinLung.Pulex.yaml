@@ -1,0 +1,25 @@
+PackageIdentifier: HelloKittyXamKinLung.Pulex
+PackageVersion: 3.0.1
+PackageLocale: en-US
+Publisher: HelloKittyXamKinLung
+PackageName: Pulex
+License: MIT
+ShortDescription: High-Performance Tabular Data & Security Forensic Log Analyzer (Tauri v2 + DuckDB 1.2.2)
+Tags:
+  - csv
+  - parquet
+  - duckdb
+  - evtx
+  - security
+  - forensics
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: Pulex-3.0.1-x64-portable.exe
+        PortableCommandAlias: pulex
+    InstallerUrl: https://github.com/p1rkr41n/pulex/releases/download/v3.0.1/Pulex-3.0.1-x64-portable.zip
+    InstallerSha256: A2FFF91839E70AFDADE481938B8A99A7AAC41A08C0963ECF45C0734F06C57080
+ManifestType: singleton
+ManifestVersion: 1.6.0

@@ -1,0 +1,956 @@
+//! query.rs
+//!
+//! Query and Engine Command Handlers for Pulex Desktop (Tauri v2)
+//! Bridges frontend Reltab and Viewer IPC commands to the native DuckDB engine,
+//! Binary Guard, Streaming Transcoder, Derived View Registry, and Arrow IPC streamer.
+
+use crate::engine::query_compiler::{QueryExpCompiler, QueryRep};
+use crate::engine::stats_cache::{ColumnStatsDto, ColumnStatsMap};
+use crate::ingest::binary_guard::{inspect_file, FileFormatCategory};
+use crate::ingest::csv_streamer::{effective_extension, ingest_csv_file};
+use crate::ingest::dirty_log::ingest_dirty_log;
+use crate::ingest::evtx_parser::ingest_evtx_file;
+use crate::ingest::jsonl_streamer::ingest_jsonl_file;
+use crate::ingest::scheduler::CancellationToken;
+use crate::ledger::parquet_ledger::{build_cache_parquet_name, compute_cache_hash};
+use crate::state::{AppState, DerivedViewSpec};
+use duckdb::types::ValueRef;
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use tauri::ipc::Response;
+use tauri::AppHandle;
+
+/// Evaluates a QueryExp AST and streams the results as an Apache Arrow IPC Stream (0xFFFFFFFF marker)
+pub async fn handle_eval_query(
+    _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Response, String> {
+    let (query_rep, offset, limit) = extract_query_and_pagination(&payload)?;
+    ensure_referenced_view_exists(state, &query_rep).await;
+
+    let sql = QueryExpCompiler::compile(&query_rep, offset, limit)
+        .map_err(|e| format!("QueryExp AST compilation error: {}", e))?;
+
+    tracing::debug!("Compiled DuckDB SQL: {}", sql);
+
+    let pool = state.get_duckdb_pool().await;
+    pool.eval_query_arrow(sql).await
+}
+
+/// Computes the exact row count for a QueryExp or table
+pub async fn handle_row_count(
+    _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    let (query_rep, _, _) = extract_query_and_pagination(&payload)?;
+    ensure_referenced_view_exists(state, &query_rep).await;
+
+    let source_hint = match &query_rep {
+        QueryRep::Table { table_name } => Some(table_name.clone()),
+        _ => None,
+    };
+
+    let count_sql = QueryExpCompiler::compile_count(&query_rep)
+        .map_err(|e| format!("QueryExp count compilation error: {}", e))?;
+
+    let pool = state.get_duckdb_pool().await;
+    let count = pool.eval_row_count(count_sql, source_hint).await?;
+    Ok(json!({ "rowCount": count }))
+}
+
+/// Retrieves the reltab.Schema DTO for a table or query
+pub async fn handle_schema(
+    _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    let target = if let Some(tbl) = payload
+        .get("tableName")
+        .or_else(|| payload.get("table_name"))
+        .and_then(|v| v.as_str())
+    {
+        if let Some(derived) = state.get_derived_view(tbl).await {
+            let pool = state.get_duckdb_pool().await;
+            let ddl = derived.sql_ddl.clone();
+            let _ = pool
+                .eval_ui_conn(move |conn| conn.execute_batch(&ddl).map_err(|e| e.to_string()))
+                .await;
+        }
+        tbl.to_string()
+    } else if let Some(sql) = payload
+        .get("sql")
+        .or_else(|| payload.get("sqlQuery"))
+        .and_then(|v| v.as_str())
+    {
+        sql.to_string()
+    } else if let Ok((query_rep, _, _)) = extract_query_and_pagination(&payload) {
+        ensure_referenced_view_exists(state, &query_rep).await;
+        QueryExpCompiler::compile(&query_rep, None, Some(0))
+            .unwrap_or_else(|_| "main_table".to_string())
+    } else {
+        "main_table".to_string()
+    };
+
+    let pool = state.get_duckdb_pool().await;
+    let schema_dto = pool.eval_schema(target).await?;
+    serde_json::to_value(&schema_dto).map_err(|e| format!("Schema serialization error: {}", e))
+}
+
+/// Executes arbitrary SQL and streams Arrow IPC
+pub async fn handle_run_sql_arrow(
+    _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Response, String> {
+    let sql = payload
+        .get("sql")
+        .or_else(|| payload.get("sqlQuery"))
+        .or_else(|| payload.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing required 'sql' or 'sqlQuery' field in payload".to_string())?;
+
+    tracing::debug!("Executing arbitrary SQL Arrow query: {}", sql);
+    let pool = state.get_duckdb_pool().await;
+    pool.eval_query_arrow(sql.to_string()).await
+}
+
+/// Inspect a cached Parquet file for single-column corruption (`raw_event`, `column0`, unsplit CSV header)
+fn is_corrupted_single_column_cache(conn: &duckdb::Connection, parquet_path: &Path, is_delimited: bool) -> bool {
+    let pq_str = parquet_path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "''");
+    let sql = format!("DESCRIBE SELECT * FROM read_parquet('{}') LIMIT 0;", pq_str);
+    if let Ok(mut stmt) = conn.prepare(&sql) {
+        if let Ok(mut rows) = stmt.query([]) {
+            let mut cols = Vec::new();
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(name) = row.get::<_, String>(0) {
+                    cols.push(name);
+                }
+            }
+            if cols.len() == 1 && is_delimited {
+                let c0 = cols[0].trim();
+                if c0.eq_ignore_ascii_case("column0")
+                    || c0.eq_ignore_ascii_case("column00")
+                    || c0.contains(',')
+                    || c0.contains('\t')
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Build an EVTX projection expression that preserves both Toad DFIR PascalCase aliases
+/// and Pulex snake_case columns. All identifiers are double-quoted so DuckDB reserved
+/// keywords like `binary` are never misparsed as SQL data types.
+fn build_evtx_parquet_projection(sanitized_parquet_path: &str) -> String {
+    format!(
+        "(SELECT \
+            \"record_id\" AS \"RecordID\", \
+            \"time_created\" AS \"TimeCreated\", \
+            \"event_id\" AS \"EventID\", \
+            COALESCE(\"level_name\", CAST(\"level\" AS VARCHAR)) AS \"Level\", \
+            \"provider_name\" AS \"Provider\", \
+            \"channel\" AS \"Channel\", \
+            \"computer\" AS \"Computer\", \
+            \"user_id\" AS \"UserId\", \
+            \"param1\", \
+            \"param2\", \
+            \"param3\", \
+            \"binary\" AS \"Binary\", \
+            COALESCE(\"event_data\", \"payload_json\") AS \"EventData\", \
+            \"record_id\", \
+            \"time_created\", \
+            \"event_id\", \
+            \"provider_name\", \
+            \"level\", \
+            \"channel\", \
+            \"computer\", \
+            \"user_id\", \
+            \"payload_json\" \
+         FROM read_parquet('{}'))",
+        sanitized_parquet_path
+    )
+}
+
+/// Retrieves the active main table name, dynamically binding the target file to DuckDB views
+pub async fn handle_get_table_name(
+    _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    let raw_target = payload
+        .get("resourceId")
+        .or_else(|| payload.get("filePath"))
+        .or_else(|| payload.get("file_path"))
+        .or_else(|| {
+            payload
+                .get("path")
+                .and_then(|p| p.get("sourceId"))
+                .and_then(|s| s.get("resourceId"))
+        })
+        .or_else(|| {
+            payload
+                .get("req")
+                .and_then(|r| r.get("path"))
+                .and_then(|p| p.get("sourceId"))
+                .and_then(|s| s.get("resourceId"))
+        })
+        .or_else(|| payload.get("engine").and_then(|e| e.get("resourceId")))
+        .and_then(|v| v.as_str());
+
+    // Optional explicit table/child node inside a multi-table .duckdb or .sqlite file
+    let requested_subtable = payload
+        .get("tableName")
+        .or_else(|| {
+            payload
+                .get("path")
+                .and_then(|p| p.get("path"))
+                .and_then(|arr| arr.as_array())
+                .and_then(|arr| arr.last())
+        })
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(|s| s.to_string());
+
+    let file_path = match raw_target {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => return Ok(json!("main_table")),
+    };
+
+    // Check if raw_target is actually a registered derived view name
+    if let Some(derived) = state.get_derived_view(file_path).await {
+        let pool = state.get_duckdb_pool().await;
+        let ddl = derived.sql_ddl.clone();
+        let vname = derived.view_name.clone();
+        pool.eval_ui_conn(move |conn| conn.execute_batch(&ddl).map_err(|e| e.to_string()))
+            .await?;
+        return Ok(json!(vname));
+    }
+
+    let path_obj = Path::new(file_path);
+    if !path_obj.exists() {
+        // Offline cache check in ParquetLedger before giving up
+        let ledger = state.parquet_ledger.read().await;
+        let norm = crate::ledger::parquet_ledger::normalize_path(file_path);
+        let st = ledger.state.read().await;
+        if let Some(f) = st.files.get(&norm) {
+            let pq = Path::new(&f.parquet_path);
+            if !f.parquet_path.is_empty() && pq.exists() {
+                let hash = compute_cache_hash(file_path, f.file_size.max(0) as u64, f.source_mtime);
+                let view_name = format!("tbl_{:08x}", hash);
+                let safe_pq = pq.to_string_lossy().replace('\\', "/").replace('\'', "''");
+                let ddl = format!(
+                    "CREATE OR REPLACE VIEW \"{v}\" AS SELECT * FROM read_parquet('{p}');\nCREATE OR REPLACE VIEW \"main_table\" AS SELECT * FROM \"{v}\";",
+                    v = view_name,
+                    p = safe_pq
+                );
+                let pool = state.get_duckdb_pool().await;
+                pool.eval_ui_conn(move |conn| conn.execute_batch(&ddl).map_err(|e| e.to_string()))
+                    .await?;
+                return Ok(json!(view_name));
+            }
+        }
+        return Err(format!("Target file does not exist on disk: {}", file_path));
+    }
+
+    // 1. Binary Guard inspection when enabled in config.ini
+    let cfg = state.get_config().await;
+    let format_cat = if cfg.system.binary_guard {
+        inspect_file(path_obj).map_err(|e| e.to_string())?
+    } else {
+        inspect_file(path_obj).unwrap_or(FileFormatCategory::DelimitedText)
+    };
+
+    let (size, mtime_ms) = if let Ok(meta) = std::fs::metadata(path_obj) {
+        let size = meta.len();
+        let mtime_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        (size, mtime_ms)
+    } else {
+        (0, 0)
+    };
+
+    let path_hash = compute_cache_hash(file_path, size, mtime_ms);
+    let view_name = format!("tbl_{:08x}", path_hash);
+    let cache_name = build_cache_parquet_name(path_obj, file_path, size, mtime_ms);
+    let temp_dir = state.portable_dir.join("temp");
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let ext = effective_extension(path_obj);
+    let pool = state.get_duckdb_pool().await;
+
+    // 2. Native multi-table DuckDB / SQLite database container handling
+    if format_cat == FileFormatCategory::DuckDb || ext == "duckdb" {
+        let alias = format!("db_{:08x}", path_hash);
+        let safe_db = file_path.replace('\\', "/").replace('\'', "''");
+        let vname = view_name.clone();
+        let sub = requested_subtable.clone();
+        pool.eval_ui_conn(move |conn| {
+            let _ = conn.execute_batch(&format!("ATTACH IF NOT EXISTS '{}' AS \"{}\" (READ_ONLY);", safe_db, alias));
+            let target_tbl = if let Some(t) = sub {
+                t
+            } else {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT table_name FROM information_schema.tables WHERE table_catalog = '{}' AND table_type IN ('BASE TABLE', 'VIEW') ORDER BY table_name LIMIT 1;",
+                        alias
+                    ))
+                    .map_err(|e| e.to_string())?;
+                stmt.query_row([], |r| r.get::<_, String>(0))
+                    .map_err(|_| "DuckDB database contains no tables".to_string())?
+            };
+            let q_tbl = target_tbl.replace('"', "\"\"");
+            let ddl = format!(
+                "CREATE OR REPLACE VIEW \"{v}\" AS SELECT * FROM \"{a}\".\"{t}\";\nCREATE OR REPLACE VIEW \"main_table\" AS SELECT * FROM \"{v}\";",
+                v = vname,
+                a = alias,
+                t = q_tbl
+            );
+            conn.execute_batch(&ddl).map_err(|e| e.to_string())
+        })
+        .await?;
+        return Ok(json!(view_name));
+    }
+
+    if format_cat == FileFormatCategory::Sqlite || matches!(ext.as_str(), "sqlite" | "sqlite3" | "db") {
+        let alias = format!("sq_{:08x}", path_hash);
+        let safe_db = file_path.replace('\\', "/").replace('\'', "''");
+        let vname = view_name.clone();
+        let sub = requested_subtable.clone();
+        pool.eval_ui_conn(move |conn| {
+            let _ = conn.execute_batch("INSTALL sqlite; LOAD sqlite;");
+            conn.execute_batch(&format!(
+                "ATTACH IF NOT EXISTS '{}' AS \"{}\" (TYPE SQLITE, READ_ONLY);",
+                safe_db, alias
+            ))
+            .map_err(|e| format!("SQLite attach error (ensure DuckDB sqlite extension is available): {}", e))?;
+            let target_tbl = if let Some(t) = sub {
+                t
+            } else {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT table_name FROM information_schema.tables WHERE table_catalog = '{}' ORDER BY table_name LIMIT 1;",
+                        alias
+                    ))
+                    .map_err(|e| e.to_string())?;
+                stmt.query_row([], |r| r.get::<_, String>(0))
+                    .map_err(|_| "SQLite database contains no tables".to_string())?
+            };
+            let q_tbl = target_tbl.replace('"', "\"\"");
+            let ddl = format!(
+                "CREATE OR REPLACE VIEW \"{v}\" AS SELECT * FROM \"{a}\".\"{t}\";\nCREATE OR REPLACE VIEW \"main_table\" AS SELECT * FROM \"{v}\";",
+                v = vname,
+                a = alias,
+                t = q_tbl
+            );
+            conn.execute_batch(&ddl).map_err(|e| e.to_string())
+        })
+        .await?;
+        return Ok(json!(view_name));
+    }
+
+    // 3. Locate existing Parquet cache across temp_dir and project subdirectories
+    let mut cached_parquet_path: Option<PathBuf> = None;
+    if temp_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() && !p.file_name().unwrap_or_default().to_string_lossy().starts_with(".trash") {
+                    let candidate = p.join(&cache_name);
+                    if candidate.exists() && candidate.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                        cached_parquet_path = Some(candidate);
+                        break;
+                    }
+                } else if p.is_file() && p.file_name().map(|n| n == cache_name.as_str()).unwrap_or(false) {
+                    if p.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+                        cached_parquet_path = Some(p);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let is_delimited = matches!(ext.as_str(), "csv" | "tsv" | "tab" | "psv");
+    if let Some(ref pq_path) = cached_parquet_path {
+        let pq_clone = pq_path.clone();
+        let corrupt = pool
+            .eval_ui_conn(move |conn| Ok(is_corrupted_single_column_cache(conn, &pq_clone, is_delimited)))
+            .await
+            .unwrap_or(false);
+        if corrupt {
+            tracing::warn!("Evicting corrupted single-column Parquet cache {:?}", pq_path);
+            let _ = std::fs::remove_file(pq_path);
+            cached_parquet_path = None;
+        }
+    }
+
+    // 4. Foreground conversion to Parquet cache when needed (EVTX, Gzip, UTF-16, Delimited, JSONL, Dirty Log)
+    if cached_parquet_path.is_none() && format_cat != FileFormatCategory::Parquet && ext != "parquet" {
+        let sched = state.get_ingest_scheduler().await;
+        if let Some(in_flight_pq) = sched.wait_if_in_flight(file_path).await? {
+            cached_parquet_path = Some(in_flight_pq);
+        }
+    }
+
+    if cached_parquet_path.is_none() && format_cat != FileFormatCategory::Parquet && ext != "parquet" {
+        let sched = state.get_ingest_scheduler().await;
+        let dispatcher = sched.dispatcher.clone();
+        let active_pid = {
+            let ledger = state.parquet_ledger.read().await;
+            let (pid, _) = ledger.get_workspace().await;
+            if pid.is_empty() {
+                "default".to_string()
+            } else {
+                pid
+            }
+        };
+        let target_dir = temp_dir.join(&active_pid);
+        let _ = std::fs::create_dir_all(&target_dir);
+        let target_pq = target_dir.join(&cache_name);
+        let fid = format!("fg_{:08x}", path_hash);
+        let ct = CancellationToken::new();
+        let src_buf = path_obj.to_path_buf();
+        let dst_buf = target_pq.clone();
+
+        if format_cat == FileFormatCategory::Evtx || ext == "evtx" {
+            let disp_bg = dispatcher.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                ingest_evtx_file(&fid, &src_buf, &dst_buf, 4, &ct, Some(&disp_bg))
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            res?;
+            cached_parquet_path = Some(target_pq);
+        } else if format_cat == FileFormatCategory::JsonText
+            || matches!(ext.as_str(), "json" | "jsonl" | "ndjson")
+        {
+            let disp_bg = dispatcher.clone();
+            pool.run_ingest_task(move |conn| {
+                ingest_jsonl_file(&fid, &src_buf, &dst_buf, &conn, &ct, Some(&disp_bg)).map(|_| ())
+            })
+            .await?;
+            cached_parquet_path = Some(target_pq);
+        } else if ext == "log"
+            && format_cat != FileFormatCategory::GzipText
+            && format_cat != FileFormatCategory::Utf16Text
+        {
+            let disp_bg = dispatcher.clone();
+            tokio::task::spawn_blocking(move || {
+                ingest_dirty_log(&fid, &src_buf, &dst_buf, &ct, Some(&disp_bg))
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            cached_parquet_path = Some(target_pq);
+        } else {
+            // CSV / TSV / TXT / GzipText / Utf16Text -> RFC-4180 sniffer + UTF-8 transcoder + 3-tier fallback
+            let disp_bg = dispatcher.clone();
+            pool.run_ingest_task(move |conn| {
+                ingest_csv_file(&fid, &src_buf, &dst_buf, &conn, &ct, Some(&disp_bg)).map(|_| ())
+            })
+            .await?;
+            cached_parquet_path = Some(target_pq);
+        }
+    }
+
+    let sanitized_target = if let Some(ref pq) = cached_parquet_path {
+        pq.to_string_lossy().replace('\\', "/").replace('\'', "''")
+    } else {
+        file_path.replace('\\', "/").replace('\'', "''")
+    };
+
+    let source_expr = if format_cat == FileFormatCategory::Evtx || ext == "evtx" {
+        build_evtx_parquet_projection(&sanitized_target)
+    } else {
+        format!("read_parquet('{}')", sanitized_target)
+    };
+
+    let ddl = format!(
+        "CREATE OR REPLACE VIEW \"{v}\" AS SELECT * FROM {src};\nCREATE OR REPLACE VIEW \"main_table\" AS SELECT * FROM \"{v}\";",
+        v = view_name,
+        src = source_expr
+    );
+
+    pool.eval_ui_conn(move |conn| {
+        conn.execute_batch(&ddl)
+            .map_err(|e| format!("Failed to create DuckDB view for file: {}", e))
+    })
+    .await?;
+
+    Ok(json!(view_name))
+}
+
+/// Re-materialize any persisted derived view referenced by a QueryRep before compilation/execution
+async fn ensure_referenced_view_exists(state: &AppState, rep: &QueryRep) {
+    if let QueryRep::Table { table_name } = rep {
+        if let Some(derived) = state.get_derived_view(table_name).await {
+            let pool = state.get_duckdb_pool().await;
+            let ddl = derived.sql_ddl;
+            let _ = pool
+                .eval_ui_conn(move |conn| conn.execute_batch(&ddl).map_err(|e| e.to_string()))
+                .await;
+        }
+    }
+}
+
+/// Register a derived SQL view (e.g. Regex Column Split `_rx1`) in memory, disk, and live DuckDB session
+pub async fn handle_register_derived_view(
+    state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    let view_name = payload
+        .get("viewName")
+        .or_else(|| payload.get("view_name"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing viewName in view:register_derived".to_string())?
+        .to_string();
+    let base_table = payload
+        .get("baseTable")
+        .or_else(|| payload.get("base_table"))
+        .or_else(|| payload.get("parentTable"))
+        .or_else(|| payload.get("parent_table"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("main_table")
+        .to_string();
+    let sql_ddl = payload
+        .get("sqlDdl")
+        .or_else(|| payload.get("sql_ddl"))
+        .or_else(|| payload.get("sql"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing sqlDdl in view:register_derived".to_string())?
+        .to_string();
+    let source_column = payload
+        .get("sourceColumn")
+        .or_else(|| payload.get("source_column"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let regex_pattern = payload
+        .get("regexPattern")
+        .or_else(|| payload.get("regex_pattern"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let pool = state.get_duckdb_pool().await;
+    let ddl_exec = sql_ddl.clone();
+    pool.eval_ui_conn(move |conn| conn.execute_batch(&ddl_exec).map_err(|e| e.to_string()))
+        .await?;
+
+    let spec = DerivedViewSpec {
+        view_name: view_name.clone(),
+        base_table,
+        sql_ddl,
+        source_column,
+        regex_pattern,
+        created_at_ms: crate::ledger::parquet_ledger::current_time_ms(),
+    };
+    state.register_derived_view(spec.clone()).await?;
+
+    Ok(json!({
+        "success": true,
+        "viewName": view_name,
+        "spec": spec
+    }))
+}
+
+/// Retrieve metadata for a registered derived view (or list all registered derived views)
+pub async fn handle_get_derived_view(state: &AppState, payload: Value) -> Result<Value, String> {
+    if let Some(view_name) = payload
+        .get("viewName")
+        .or_else(|| payload.get("view_name"))
+        .and_then(|v| v.as_str())
+    {
+        if let Some(spec) = state.get_derived_view(view_name).await {
+            return serde_json::to_value(&spec).map_err(|e| e.to_string());
+        }
+        return Ok(Value::Null);
+    }
+    let map = state.derived_views.read().await;
+    serde_json::to_value(&*map).map_err(|e| e.to_string())
+}
+
+fn extract_query_and_pagination(
+    payload: &Value,
+) -> Result<(QueryRep, Option<i64>, Option<i64>), String> {
+    let offset = payload.get("offset").and_then(|v| v.as_i64());
+    let limit = payload.get("limit").and_then(|v| v.as_i64());
+
+    let query_val = payload
+        .get("queryExp")
+        .or_else(|| payload.get("query"))
+        .or_else(|| payload.get("queryStr"))
+        .or_else(|| payload.get("req"))
+        .unwrap_or(payload);
+
+    let query_rep = QueryExpCompiler::parse_query_exp(query_val)?;
+    Ok((query_rep, offset, limit))
+}
+
+/// Retrieves the root node metadata for a data source connection
+pub async fn handle_get_root_node(
+    _app: AppHandle,
+    _state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    let resource_id = payload
+        .get("resourceId")
+        .or_else(|| payload.get("filePath"))
+        .or_else(|| payload.get("file_path"))
+        .or_else(|| {
+            payload
+                .get("path")
+                .and_then(|p| p.get("sourceId"))
+                .and_then(|s| s.get("resourceId"))
+        })
+        .or_else(|| {
+            payload
+                .get("req")
+                .and_then(|r| r.get("path"))
+                .and_then(|p| p.get("sourceId"))
+                .and_then(|s| s.get("resourceId"))
+        })
+        .or_else(|| payload.get("engine").and_then(|e| e.get("resourceId")))
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    let path = Path::new(resource_id);
+    let display_name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| resource_id.to_string());
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let is_db_container = matches!(ext.as_str(), "duckdb" | "sqlite" | "sqlite3" | "db");
+    let is_dir = path.is_dir() || is_db_container;
+    let kind = if path.is_dir() {
+        "Directory"
+    } else if is_db_container {
+        "Database"
+    } else {
+        "File"
+    };
+    let size = path.metadata().ok().map(|m| m.len());
+
+    Ok(json!({
+        "id": ".",
+        "kind": kind,
+        "displayName": display_name,
+        "isContainer": is_dir,
+        "fileSizeBytes": size
+    }))
+}
+
+/// Retrieves child nodes for a directory or multi-table database container (.duckdb / .sqlite)
+pub async fn handle_get_children(
+    _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    let resource_id = payload
+        .get("resourceId")
+        .or_else(|| payload.get("filePath"))
+        .or_else(|| payload.get("file_path"))
+        .or_else(|| {
+            payload
+                .get("path")
+                .and_then(|p| p.get("sourceId"))
+                .and_then(|s| s.get("resourceId"))
+        })
+        .or_else(|| payload.get("engine").and_then(|e| e.get("resourceId")))
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    let path = Path::new(resource_id);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if path.is_file() && matches!(ext.as_str(), "duckdb" | "sqlite" | "sqlite3" | "db") {
+        let pool = state.get_duckdb_pool().await;
+        let safe_db = resource_id.replace('\\', "/").replace('\'', "''");
+        let is_sqlite = ext != "duckdb";
+        let hash = compute_cache_hash(resource_id, 0, 0);
+        let alias = format!("cat_{:08x}", hash);
+        let tables = pool
+            .eval_ui_conn(move |conn| {
+                if is_sqlite {
+                    let _ = conn.execute_batch("INSTALL sqlite; LOAD sqlite;");
+                    let _ = conn.execute_batch(&format!(
+                        "ATTACH IF NOT EXISTS '{}' AS \"{}\" (TYPE SQLITE, READ_ONLY);",
+                        safe_db, alias
+                    ));
+                } else {
+                    let _ = conn.execute_batch(&format!(
+                        "ATTACH IF NOT EXISTS '{}' AS \"{}\" (READ_ONLY);",
+                        safe_db, alias
+                    ));
+                }
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT table_name FROM information_schema.tables WHERE table_catalog = '{}' ORDER BY table_name;",
+                        alias
+                    ))
+                    .map_err(|e| e.to_string())?;
+                let mut out = Vec::new();
+                let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+                while let Ok(Some(r)) = rows.next() {
+                    if let Ok(name) = r.get::<_, String>(0) {
+                        out.push(json!({
+                            "id": name,
+                            "kind": "Table",
+                            "displayName": name,
+                            "isContainer": false
+                        }));
+                    }
+                }
+                Ok(out)
+            })
+            .await
+            .unwrap_or_default();
+        return Ok(json!(tables));
+    }
+
+    if path.is_dir() {
+        let mut children = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let is_entry_dir = p.is_dir();
+                let kind = if is_entry_dir { "Directory" } else { "File" };
+                let size = entry.metadata().ok().map(|m| m.len());
+                children.push(json!({
+                    "id": name,
+                    "kind": kind,
+                    "displayName": name,
+                    "isContainer": is_entry_dir,
+                    "fileSizeBytes": size
+                }));
+            }
+        }
+        Ok(json!(children))
+    } else {
+        Ok(json!([]))
+    }
+}
+
+/// Computes and caches column statistics using DuckDB `SUMMARIZE` when `StatsCache` misses
+pub async fn handle_get_column_stats_map(
+    _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    let pool = state.get_duckdb_pool().await;
+    if let Ok((query_rep, _, _)) = extract_query_and_pagination(&payload) {
+        ensure_referenced_view_exists(state, &query_rep).await;
+        let cache_key = match &query_rep {
+            QueryRep::Table { table_name } => table_name.clone(),
+            other => QueryExpCompiler::compile(other, None, None).unwrap_or_default(),
+        };
+        if !cache_key.is_empty() {
+            if let Some(stats) = pool.stats_cache().get(&cache_key).await {
+                return serde_json::to_value(&stats).map_err(|e| e.to_string());
+            }
+
+            if let Ok(base_sql) = QueryExpCompiler::compile(&query_rep, None, None) {
+                let sum_sql = format!("SUMMARIZE SELECT * FROM ({}) AS _sum_src;", base_sql);
+                if let Ok(computed) = pool
+                    .eval_ui_conn(move |conn| {
+                        let mut stmt = conn.prepare(&sum_sql).map_err(|e| e.to_string())?;
+                        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+                        let mut stats_map = ColumnStatsMap::new();
+                        let mut row_count_opt: Option<i64> = None;
+
+                        while let Ok(Some(row)) = rows.next() {
+                            let col_name: String = row.get(0).unwrap_or_default();
+                            let col_type: String =
+                                row.get::<usize, String>(1).unwrap_or_default().to_uppercase();
+                            let min_s: Option<String> = row.get(2).ok();
+                            let max_s: Option<String> = row.get(3).ok();
+                            let approx_unique: Option<i64> = row.get(4).ok();
+                            let count: i64 = row.get(9).unwrap_or(0);
+                            let null_pct_raw: Option<f64> = row
+                                .get::<_, f64>(10)
+                                .ok()
+                                .or_else(|| row.get::<_, String>(10).ok().and_then(|s| s.trim_end_matches('%').parse::<f64>().ok()));
+
+                            if row_count_opt.is_none() {
+                                row_count_opt = Some(count);
+                            }
+                            let pct_null = null_pct_raw.map(|p| p / 100.0);
+                            let min_num = min_s.as_deref().and_then(|s| s.parse::<f64>().ok());
+                            let max_num = max_s.as_deref().and_then(|s| s.parse::<f64>().ok());
+
+                            let is_num = col_type.contains("INT")
+                                || col_type.contains("DOUBLE")
+                                || col_type.contains("FLOAT")
+                                || col_type.contains("DECIMAL")
+                                || col_type.contains("REAL");
+
+                            let dto = if is_num {
+                                ColumnStatsDto::Numeric {
+                                    min: min_num,
+                                    max: max_num,
+                                    approx_unique,
+                                    count,
+                                    pct_null,
+                                }
+                            } else {
+                                ColumnStatsDto::Text {
+                                    min: min_num,
+                                    max: max_num,
+                                    approx_unique,
+                                    count,
+                                    pct_null,
+                                }
+                            };
+                            stats_map.insert(col_name, dto);
+                        }
+                        Ok((stats_map, row_count_opt))
+                    })
+                    .await
+                {
+                    let (stats_map, rc) = computed;
+                    pool.stats_cache().insert(cache_key, stats_map.clone(), rc).await;
+                    return serde_json::to_value(&stats_map).map_err(|e| e.to_string());
+                }
+            }
+        }
+    }
+    Ok(json!({}))
+}
+
+fn duckdb_value_ref_to_json(v: ValueRef<'_>) -> Value {
+    match v {
+        ValueRef::Null => Value::Null,
+        ValueRef::Boolean(b) => json!(b),
+        ValueRef::TinyInt(n) => json!(n),
+        ValueRef::SmallInt(n) => json!(n),
+        ValueRef::Int(n) => json!(n),
+        ValueRef::BigInt(n) => json!(n),
+        ValueRef::HugeInt(n) => json!(n.to_string()),
+        ValueRef::UTinyInt(n) => json!(n),
+        ValueRef::USmallInt(n) => json!(n),
+        ValueRef::UInt(n) => json!(n),
+        ValueRef::UBigInt(n) => json!(n),
+        ValueRef::Float(f) => json!(f),
+        ValueRef::Double(f) => json!(f),
+        ValueRef::Decimal(d) => json!(d.to_string()),
+        ValueRef::Timestamp(_, micros) => json!(micros),
+        ValueRef::Text(bytes) => json!(String::from_utf8_lossy(bytes).to_string()),
+        ValueRef::Blob(bytes) => {
+            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            json!(format!("0x{}", hex))
+        }
+        ValueRef::Date32(days) => json!(days),
+        ValueRef::Time64(_, t) => json!(t),
+        other => json!(format!("{:?}", other)),
+    }
+}
+
+/// Executes arbitrary SQL query and returns rows as JSON array of objects (supporting all DuckDB types)
+pub async fn handle_run_sql(
+    _app: AppHandle,
+    state: &AppState,
+    payload: Value,
+) -> Result<Value, String> {
+    let sql = payload
+        .get("sql")
+        .or_else(|| payload.get("sqlQuery"))
+        .or_else(|| payload.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Missing required 'sql' or 'sqlQuery' field in payload".to_string())?;
+
+    let pool = state.get_duckdb_pool().await;
+    let sql_str = sql.to_string();
+    pool.eval_ui_conn(move |conn| {
+        let mut stmt = conn.prepare(&sql_str).map_err(|e| e.to_string())?;
+        let col_names: Vec<String> = stmt
+            .column_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let mut row_map = serde_json::Map::new();
+            for (i, col_name) in col_names.iter().enumerate() {
+                let val = match row.get_ref(i) {
+                    Ok(vref) => duckdb_value_ref_to_json(vref),
+                    Err(_) => Value::Null,
+                };
+                row_map.insert(col_name.clone(), val);
+            }
+            results.push(Value::Object(row_map));
+        }
+        Ok(Value::Array(results))
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_evtx_parquet_projection_quotes_reserved_binary_keyword() {
+        let tmp_dir = std::env::temp_dir().join(format!("pulex_evtx_proj_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let pq_path = tmp_dir.join("evtx_sample.parquet");
+        let pq_str = pq_path.to_string_lossy().replace('\\', "/").replace('\'', "''");
+
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        conn.execute_batch(&format!(
+            "COPY (SELECT \
+                1::BIGINT AS record_id, \
+                TIMESTAMP '2026-11-19 10:00:00' AS time_created, \
+                4624::INTEGER AS event_id, \
+                'Microsoft-Windows-Security-Auditing'::VARCHAR AS provider_name, \
+                4::INTEGER AS level, \
+                'Security'::VARCHAR AS channel, \
+                'HOST01'::VARCHAR AS computer, \
+                'S-1-5-18'::VARCHAR AS user_id, \
+                '{{}}'::VARCHAR AS payload_json, \
+                'Information'::VARCHAR AS level_name, \
+                'p1'::VARCHAR AS param1, \
+                'p2'::VARCHAR AS param2, \
+                'p3'::VARCHAR AS param3, \
+                '00FF'::VARCHAR AS \"binary\", \
+                '{{}}'::VARCHAR AS event_data, \
+                NULL::VARCHAR AS raw_event\
+            ) TO '{}' (FORMAT PARQUET);",
+            pq_str
+        ))
+        .expect("write test evtx parquet");
+
+        let proj = build_evtx_parquet_projection(&pq_str);
+        assert!(proj.contains("\"binary\" AS \"Binary\""));
+
+        let ddl = format!("CREATE OR REPLACE VIEW \"tbl_evtx_test\" AS SELECT * FROM {};", proj);
+        conn.execute_batch(&ddl)
+            .expect("EVTX projection view creation must succeed with quoted binary column");
+
+        let binary_val: String = conn
+            .query_row("SELECT \"Binary\" FROM \"tbl_evtx_test\" LIMIT 1", [], |r| r.get(0))
+            .expect("query Binary column");
+        assert_eq!(binary_val, "00FF");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+}

@@ -1,0 +1,204 @@
+/* ==========================================================================
+   Pulex Interactive Cell Highlight & Dynamic Full-Row Height Expansion (20 Lines)
+   ========================================================================== */
+
+/* Full-row expansion styling */
+.slick-row.slick-row-expanded {
+  overflow: visible !important;
+  z-index: 20 !important;
+  transition: height 0.12s ease-out;
+
+  .slick-cell {
+    height: 100% !important;
+    min-height: 25px;
+    box-sizing: border-box !important;
+  }
+
+  /* Sibling cells remain top-aligned single-line with ellipsis */
+  .slick-cell:not(.slick-cell-expanded-content):not(.slick-cell-active-expanded) {
+    white-space: nowrap !important;
+    text-overflow: ellipsis !important;
+    overflow: hidden !important;
+    vertical-align: top !important;
+    line-height: 25px !important;
+  }
+}
+
+/* Backward-compatible row classes */
+.slick-row.slick-row-has-expanded,
+.slick-row.slick-row-active-expanded {
+  overflow: visible !important;
+  z-index: 20 !important;
+}
+
+/* Downstream shifted row styling */
+.slick-row.slick-row-shifted-down {
+  transition: top 0.12s ease-out;
+}
+
+/* Full-Row Uniform Light Blue Highlight (Light Theme) */
+.slickgrid-container .slick-row.slick-row-highlighted,
+.slickgrid-container .slick-row.slick-row-expanded,
+.slick-row.slick-row-highlighted,
+.slick-row.slick-row-expanded {
+  background-color: #e3f2fd !important;
+  background: #e3f2fd !important;
+}
+
+.slickgrid-container .slick-row.slick-row-highlighted .slick-cell,
+.slickgrid-container .slick-row.slick-row-expanded .slick-cell,
+.slickgrid-container .slick-row.slick-row-highlighted .slick-cell.slick-cell-expand-col,
+.slickgrid-container .slick-row.slick-row-expanded .slick-cell.slick-cell-expand-col,
+.slickgrid-container .slick-row.odd.slick-row-highlighted .slick-cell.slick-cell-expand-col,
+.slickgrid-container .slick-row.even.slick-row-highlighted .slick-cell.slick-cell-expand-col,
+.slickgrid-container .slick-row.odd.slick-row-expanded .slick-cell.slick-cell-expand-col,
+.slickgrid-container .slick-row.even.slick-row-expanded .slick-cell.slick-cell-expand-col,
+.slickgrid-container .slick-row.active.slick-row-highlighted .slick-cell.slick-cell-expand-col,
+.slickgrid-container .slick-row.active.slick-row-expanded .slick-cell.slick-cell-expand-col,
+.slickgrid-container .slick-row.slick-row-highlighted .slick-cell.selected,
+.slickgrid-container .slick-row.slick-row-expanded .slick-cell.selected,
+.slickgrid-container .slick-cell.slick-row-cell-highlighted,
+.slick-row.slick-row-highlighted .slick-cell,
+.slick-row.slick-row-expanded .slick-cell,
+.slick-cell.slick-row-cell-highlighted {
+  background-color: #e3f2fd !important;
+  background: #e3f2fd !important;
+  color: #0f172a !important;
+}
+
+/* Sibling cells in highlighted/expanded row must NOT have focus outline */
+.slickgrid-container .slick-row.slick-row-highlighted .slick-cell:not(.slick-cell-highlighted),
+.slickgrid-container .slick-row.slick-row-expanded .slick-cell:not(.slick-cell-highlighted),
+.slick-row.slick-row-highlighted .slick-cell:not(.slick-cell-highlighted),
+.slick-row.slick-row-expanded .slick-cell:not(.slick-cell-highlighted) {
+  outline: none !important;
+}
+
+/* Single Active Cell Focus Border (Light Theme) */
+.slickgrid-container .slick-row.slick-row-expanded .slick-cell.slick-cell-highlighted,
+.slickgrid-container .slick-row.slick-row-highlighted .slick-cell.slick-cell-highlighted,
+.slickgrid-container .slick-row .slick-cell.slick-cell-highlighted,
+.slick-row .slick-cell.slick-cell-highlighted,
+.slick-cell.slick-cell-highlighted {
+  background-color: #e3f2fd !important;
+  background: #e3f2fd !important;
+  outline: 1px solid #0284c7 !important;
+  outline-offset: -1px;
+  color: #0f172a !important;
+  z-index: 2;
+}
+
+/* Expanded active cell content formatting */
+.slickgrid-container .slick-row.slick-row-expanded .slick-cell.slick-cell-expanded-content,
+.slickgrid-container .slick-row.slick-row-expanded .slick-cell.slick-cell-active-expanded,
+.slick-cell.slick-cell-expanded-content,
+.slick-cell.slick-cell-active-expanded {
+  contain: none !important;
+  /* CRITICAL: overrides contain: strict */
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  text-overflow: clip !important;
+  overscroll-behavior: contain !important;
+  line-height: 18px !important;
+  padding: 3px 6px !important;
+  box-sizing: border-box !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
+  overflow-x: hidden !important;
+
+  /* Custom Slim Scrollbars for N > 20 lines */
+  &::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.5);
+    border-radius: 2px;
+  }
+
+  &::-webkit-scrollbar-thumb:hover {
+    background: rgba(100, 116, 139, 0.8);
+  }
+}
+
+/* Dark Theme Adaptive Light Blue Highlight (.bp4-dark / .toad-dark) */
+.toad-dark,
+.bp4-dark {
+
+  .slickgrid-container .slick-row.slick-row-highlighted,
+  .slickgrid-container .slick-row.slick-row-expanded,
+  .slick-row.slick-row-highlighted,
+  .slick-row.slick-row-expanded {
+    background-color: rgba(56, 189, 248, 0.22) !important;
+    background: rgba(56, 189, 248, 0.22) !important;
+  }
+
+  .slickgrid-container .slick-row.slick-row-highlighted .slick-cell,
+  .slickgrid-container .slick-row.slick-row-expanded .slick-cell,
+  .slickgrid-container .slick-row.slick-row-highlighted .slick-cell.slick-cell-expand-col,
+  .slickgrid-container .slick-row.slick-row-expanded .slick-cell.slick-cell-expand-col,
+  .slickgrid-container .slick-row.odd.slick-row-highlighted .slick-cell.slick-cell-expand-col,
+  .slickgrid-container .slick-row.even.slick-row-highlighted .slick-cell.slick-cell-expand-col,
+  .slickgrid-container .slick-row.odd.slick-row-expanded .slick-cell.slick-cell-expand-col,
+  .slickgrid-container .slick-row.even.slick-row-expanded .slick-cell.slick-cell-expand-col,
+  .slickgrid-container .slick-row.active.slick-row-highlighted .slick-cell.slick-cell-expand-col,
+  .slickgrid-container .slick-row.active.slick-row-expanded .slick-cell.slick-cell-expand-col,
+  .slickgrid-container .slick-row.slick-row-highlighted .slick-cell.selected,
+  .slickgrid-container .slick-row.slick-row-expanded .slick-cell.selected,
+  .slickgrid-container .slick-row.slick-row-highlighted:hover .slick-cell,
+  .slickgrid-container .slick-row.slick-row-expanded:hover .slick-cell,
+  .slickgrid-container .slick-cell.slick-row-cell-highlighted,
+  .slick-row.slick-row-highlighted .slick-cell,
+  .slick-row.slick-row-expanded .slick-cell,
+  .slick-cell.slick-row-cell-highlighted {
+    background-color: rgba(56, 189, 248, 0.22) !important;
+    background: rgba(56, 189, 248, 0.22) !important;
+    color: var(--md-sys-color-on-surface, #e3e3e8) !important;
+  }
+
+  /* Sibling cells in dark theme highlighted row must NOT have focus outline */
+  .slickgrid-container .slick-row.slick-row-highlighted .slick-cell:not(.slick-cell-highlighted),
+  .slickgrid-container .slick-row.slick-row-expanded .slick-cell:not(.slick-cell-highlighted),
+  .slick-row.slick-row-highlighted .slick-cell:not(.slick-cell-highlighted),
+  .slick-row.slick-row-expanded .slick-cell:not(.slick-cell-highlighted) {
+    outline: none !important;
+  }
+
+  /* Single Active Cell Focus Border (Dark Theme) */
+  .slickgrid-container .slick-row.slick-row-expanded .slick-cell.slick-cell-highlighted,
+  .slickgrid-container .slick-row.slick-row-highlighted .slick-cell.slick-cell-highlighted,
+  .slickgrid-container .slick-row .slick-cell.slick-cell-highlighted,
+  .slick-row .slick-cell.slick-cell-highlighted,
+  .slick-cell.slick-cell-highlighted {
+    background-color: rgba(56, 189, 248, 0.22) !important;
+    background: rgba(56, 189, 248, 0.22) !important;
+    outline: 1px solid rgba(56, 189, 248, 0.6) !important;
+    outline-offset: -1px;
+    border-color: rgba(255, 255, 255, 0.04) !important;
+    color: var(--md-sys-color-on-surface, #e3e3e8) !important;
+    box-shadow: none !important;
+    z-index: 2;
+  }
+
+  .slickgrid-container .slick-row.slick-row-expanded .slick-cell.slick-cell-expanded-content,
+  .slickgrid-container .slick-row.slick-row-expanded .slick-cell.slick-cell-active-expanded,
+  .slick-cell.slick-cell-expanded-content,
+  .slick-cell.slick-cell-active-expanded {
+    box-shadow: none !important;
+    border-radius: 0 !important;
+
+    &::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.3);
+    }
+
+    &::-webkit-scrollbar-thumb:hover {
+      background: rgba(148, 163, 184, 0.6);
+    }
+  }
+}

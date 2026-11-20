@@ -1,0 +1,43 @@
+[package]
+name = "pulex"
+version = "3.0.1"
+description = "Pulex Data Analyzer"
+authors = ["HelloKittyXamKinLung <p1rkr41n@users.noreply.github.com>"]
+edition = "2021"
+
+[lib]
+name = "pulex_lib"
+crate-type = ["staticlib", "rlib"]
+test = true
+
+[dependencies]
+tauri = { version = "2", features = ["custom-protocol"] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-fs = "2"
+duckdb = { version = "1.2.2" }
+arrow = { version = "54", default-features = false, features = ["ipc"] }
+parquet = { version = "54", default-features = false, features = ["arrow", "snap", "flate2"] }
+evtx = "0.8"
+flate2 = "1.1"
+chrono = "0.4"
+regex = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
